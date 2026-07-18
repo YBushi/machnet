@@ -22,3 +22,14 @@ target_link_libraries(core PUBLIC PkgConfig::LIBDPDK_STATIC)
 # find_library(DPDK_LIB NAMES libdpdk.a dpdk)
 # target_link_libraries(core PRIVATE dpdk numa dl)
 # target_link_libraries(core PRIVATE -Wl,--whole-archive dpdk -Wl,--no-whole-archive numa dl ${IBVERBS} ${LIBMLX4} ${LIBMLX5})
+
+# --- vendored libbpf (EPS-backed channel) ---
+# The vendored UAPI must come FIRST so <linux/bpf.h> resolves to libbpf's recent
+# copy rather than the container's 5.15-era linux-libc-dev, which predates
+# BPF_MAP_TYPE_USER_RINGBUF (added in 6.1). Same fix as UAPI_HEADERS in the EPS
+# repo's src/Makefile.
+set(LIBBPF_DIR ${PROJECT_SOURCE_DIR}/third_party/libbpf/src)
+target_include_directories(core PUBLIC
+    ${PROJECT_SOURCE_DIR}/third_party/libbpf/include/uapi
+    ${LIBBPF_DIR}/install-dir/usr/include)
+target_link_libraries(core PUBLIC ${LIBBPF_DIR}/libbpf.a elf z)

@@ -6,3 +6,8 @@ debug_build/
 release_build/
 .history
 .vscode
+third_party/libbpf/src/*.a
+third_party/libbpf/src/*.o
+third_party/libbpf/src/staticobjs/
+third_party/libbpf/src/sharedobjs/
+third_party/libbpf/src/install-dir/

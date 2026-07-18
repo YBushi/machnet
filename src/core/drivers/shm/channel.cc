@@ -6,12 +6,16 @@
 #include <channel.h>
 #include <flow.h>
 #include <glog/logging.h>
+extern "C" unsigned eps_libbpf_link_probe(void);
+extern "C" unsigned eps_libbpf_link_probe(void) {
+  return libbpf_major_version();
+}
 
 namespace juggler {
 namespace shm {
 
 ShmChannel::ShmChannel(const std::string channel_name,
-                       const MachnetChannelCtx_t *channel_ctx,
+                       const MachnetChannelCtx_t* channel_ctx,
                        const size_t channel_mem_size, const bool is_posix_shm,
                        int channel_fd)
     : name_(channel_name),
@@ -24,13 +28,17 @@ ShmChannel::ShmChannel(const std::string channel_name,
       cached_buf_count(0) {}
 
 ShmChannel::~ShmChannel() {
+  // Free any EPS RX rings we lazily opened (user_ring_buffer__new mmaps them).
+  for (auto& kv : rx_conn_cache_)
+    if (kv.second.ring) user_ring_buffer__free(kv.second.ring);
+
   __machnet_channel_destroy(
-      const_cast<void *>(reinterpret_cast<const void *>(ctx_)), mem_size_,
+      const_cast<void*>(reinterpret_cast<const void*>(ctx_)), mem_size_,
       &channel_fd_, is_posix_shm_, name_.c_str());
 }
 
-Channel::Channel(const std::string &channel_name,
-                 const MachnetChannelCtx_t *channel_ctx,
+Channel::Channel(const std::string& channel_name,
+                 const MachnetChannelCtx_t* channel_ctx,
                  const size_t channel_mem_size, const bool is_posix_shm,
                  int channel_fd)
     : ShmChannel(channel_name, channel_ctx, channel_mem_size, is_posix_shm,
@@ -40,9 +48,9 @@ Channel::Channel(const std::string &channel_name,
 
 Channel::~Channel() { UnregisterDMAMem(); }
 
-bool Channel::RegisterMemForDMA(rte_device *dev) {
-  const auto *bufp_mem_start = GetBufPoolAddr();
-  const auto *bufp_mem_end = GetBufPoolAddr() + GetBufPoolSize();
+bool Channel::RegisterMemForDMA(rte_device* dev) {
+  const auto* bufp_mem_start = GetBufPoolAddr();
+  const auto* bufp_mem_end = GetBufPoolAddr() + GetBufPoolSize();
   const size_t page_size = IsPosixShm() ? kPageSize : kHugePage2MSize;
 
   if (attached_dev_ != nullptr) {
@@ -70,9 +78,9 @@ bool Channel::RegisterMemForDMA(rte_device *dev) {
   LOG(INFO) << "Registering " << pages_nr << " pages of size " << page_size
             << " bytes";
   for (auto i = 0u; i < pages_nr; ++i) {
-    const auto *page_addr = bufp_mem_start + i * page_size;
+    const auto* page_addr = bufp_mem_start + i * page_size;
     buffer_pages_va_[i] =
-        const_cast<void *>(static_cast<const void *>(page_addr));
+        const_cast<void*>(static_cast<const void*>(page_addr));
     buffer_pages_iova_[i] = rte_mem_virt2phy(page_addr);
     LOG(INFO) << "Page " << i << " at " << buffer_pages_va_[i] << " has IOVA "
               << buffer_pages_iova_[i];
@@ -84,8 +92,8 @@ bool Channel::RegisterMemForDMA(rte_device *dev) {
 
   // Update the IOVA addresses of the buffers in the buffer pool.
   for (auto i = 0u; i < GetTotalBufCount(); ++i) {
-    auto *msg_buf = GetMsgBuf(i);
-    const auto *buf_va = msg_buf->base();
+    auto* msg_buf = GetMsgBuf(i);
+    const auto* buf_va = msg_buf->base();
     msg_buf->set_iova(rte_mem_virt2phy(buf_va));
     if (msg_buf->iova() == RTE_BAD_IOVA) {
       LOG(ERROR) << utils::Format("Failed to get IOVA for buffer@%p)", buf_va);
@@ -95,7 +103,7 @@ bool Channel::RegisterMemForDMA(rte_device *dev) {
 
   // Register external memory with DPDK.
   const auto ret = rte_extmem_register(
-      const_cast<void *>(GetBufPoolAddr<void *>()), pages_nr * page_size,
+      const_cast<void*>(GetBufPoolAddr<void*>()), pages_nr * page_size,
       buffer_pages_iova_.data(), buffer_pages_iova_.size(), page_size);
   if (ret != 0) {
     LOG(ERROR) << "Failed to register external memory with DPDK ("
@@ -119,7 +127,7 @@ bool Channel::RegisterMemForDMA(rte_device *dev) {
     }
     LOG(INFO) << utils::Format(
         "[+] DMA mapping: VA [%p, %p) - IOVA [%p, %p)", buffer_pages_va_[i],
-        static_cast<uchar_t *>(buffer_pages_va_[i]) + page_size,
+        static_cast<uchar_t*>(buffer_pages_va_[i]) + page_size,
         static_cast<uintptr_t>(buffer_pages_iova_[i]),
         static_cast<uintptr_t>(buffer_pages_iova_[i] + page_size));
   }
@@ -139,7 +147,7 @@ void Channel::UnregisterDMAMem() {
   for (auto i = 0u; i < buffer_pages_va_.size(); ++i) {
     LOG(INFO) << utils::Format(
         "[-] DMA unmapping: VA [%p, %p) - IOVA [%p, %p)", buffer_pages_va_[i],
-        static_cast<uchar_t *>(buffer_pages_va_[i]) + page_size,
+        static_cast<uchar_t*>(buffer_pages_va_[i]) + page_size,
         static_cast<uintptr_t>(buffer_pages_iova_[i]),
         static_cast<uintptr_t>(buffer_pages_iova_[i]) + page_size);
 #pragma GCC diagnostic push
@@ -157,7 +165,7 @@ void Channel::UnregisterDMAMem() {
 
   const auto pages_nr = buffer_pages_va_.size();
   const auto ret = rte_extmem_unregister(
-      const_cast<void *>(GetBufPoolAddr<void *>()), pages_nr * page_size);
+      const_cast<void*>(GetBufPoolAddr<void*>()), pages_nr * page_size);
   if (ret != 0) {
     LOG(ERROR) << "Failed to unregister external memory with DPDK ("
                << rte_strerror(rte_errno) << ")";
@@ -167,7 +175,7 @@ void Channel::UnregisterDMAMem() {
 }
 
 void Channel::RemoveFlow(
-    const std::list<std::unique_ptr<Flow>>::const_iterator &flow_it) {
+    const std::list<std::unique_ptr<Flow>>::const_iterator& flow_it) {
   active_flows_.erase(flow_it);
 }
 
