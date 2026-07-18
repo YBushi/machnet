@@ -633,6 +633,202 @@ TEST(EpsDequeue, PoolExhaustionIsBackpressure) {
   for (auto* b : hogged) EXPECT_TRUE(ch->MsgBufFree(b));
 }
 
+TEST(EpsTxRouting, StampsRegisteredFlow) {
+  juggler::shm::ChannelManager mgr;
+  FakeTxRing ring;
+  auto* ch = MakeEpsChannel(&mgr, "-eps-tx-stamp", &ring);
+
+  const juggler::shm::EpsConnKey conn{1234, 7};
+  const MachnetFlow_t flow = {.src_ip = 0x0A000001,
+                              .dst_ip = 0x0A000002,
+                              .src_port = 5555,
+                              .dst_port = 6666};
+  ch->RegisterEpsTxFlow(conn, flow);
+
+  std::vector<uint8_t> payload(256);
+  std::iota(payload.begin(), payload.end(), 0);
+  PushRecord(&ring, conn.pid, conn.fd, payload.data(), payload.size());
+
+  MachnetRingSlot_t idx[4];
+  juggler::shm::MsgBuf* bufs[4];
+  ASSERT_EQ(ch->DequeueMessages(idx, bufs, 4), 1u);
+  EXPECT_EQ(bufs[0]->length(), payload.size());
+  EXPECT_EQ(memcmp(bufs[0]->head_data(), payload.data(), payload.size()), 0);
+  // The flow the lookup stamped onto the MsgBuf.
+  EXPECT_EQ(bufs[0]->flow()->src_ip, flow.src_ip);
+  EXPECT_EQ(bufs[0]->flow()->dst_ip, flow.dst_ip);
+  EXPECT_EQ(bufs[0]->flow()->src_port, flow.src_port);
+  EXPECT_EQ(bufs[0]->flow()->dst_port, flow.dst_port);
+  EXPECT_EQ(ring.cons, StrideFor(payload.size()));
+  EXPECT_TRUE(ch->MsgBufFree(bufs[0]));
+}
+
+TEST(EpsTxRouting, UnknownFlowStalls) {
+  juggler::shm::ChannelManager mgr;
+  FakeTxRing ring;
+  auto* ch = MakeEpsChannel(&mgr, "-eps-tx-miss", &ring);
+
+  // Register SOME flow so routing is in strict mode (map non-empty).
+  const MachnetFlow_t flow = {
+      .src_ip = 1, .dst_ip = 2, .src_port = 3, .dst_port = 4};
+  ch->RegisterEpsTxFlow(juggler::shm::EpsConnKey{1234, 7}, flow);
+
+  // Push a record for a DIFFERENT, unregistered connection.
+  std::vector<uint8_t> payload(64, 0xEE);
+  PushRecord(&ring, 9999, 9, payload.data(), payload.size());
+
+  MachnetRingSlot_t idx[4];
+  juggler::shm::MsgBuf* bufs[4];
+  EXPECT_EQ(ch->DequeueMessages(idx, bufs, 4), 0u);  // stalled, not produced
+  EXPECT_EQ(ring.cons, 0u);                          // consumer NOT advanced
+}
+
+TEST(EpsLoopback, TxSeamToRxSeam) {
+  using juggler::shm::EpsConnKey;
+  const uint32_t kInnerSize = 4096;
+
+  juggler::shm::ChannelManager mgr;
+  FakeTxRing ring;
+  auto* ch = MakeEpsChannel(&mgr, "-eps-loop", &ring);
+  const uint32_t free_before = ch->GetFreeBufCount();
+
+  // RX side: outer map + one inner ring for the destination connection.
+  int tmpl_fd = bpf_map_create(BPF_MAP_TYPE_USER_RINGBUF, "loop_tmpl", 0, 0,
+                               kInnerSize, nullptr);
+  ASSERT_GE(tmpl_fd, 0);
+  LIBBPF_OPTS(bpf_map_create_opts, oopts,
+              .inner_map_fd = static_cast<uint32_t>(tmpl_fd));
+  int outer_fd =
+      bpf_map_create(BPF_MAP_TYPE_HASH_OF_MAPS, "loop_rings",
+                     sizeof(EpsConnKey), sizeof(uint32_t), 8, &oopts);
+  ASSERT_GE(outer_fd, 0);
+  const EpsConnKey dst{2000, 9};
+  int inner = bpf_map_create(BPF_MAP_TYPE_USER_RINGBUF, "loop_conn", 0, 0,
+                             kInnerSize, nullptr);
+  ASSERT_GE(inner, 0);
+  ASSERT_EQ(bpf_map_update_elem(outer_fd, &dst, &inner, BPF_ANY), 0);
+  close(inner);
+  ch->SetEpsRxRingsFd(outer_fd);
+
+  // Routing: TX stamps flow F onto the buf; RX routes F -> dst's ring.
+  const EpsConnKey src{1000, 3};
+  const MachnetFlow_t flow = {.src_ip = 0x0A000001,
+                              .dst_ip = 0x0A000002,
+                              .src_port = 1111,
+                              .dst_port = 2222};
+  ch->RegisterEpsTxFlow(src, flow);      // conn(src) -> flow
+  ch->RegisterEpsRxFlow(flow, dst, -1);  // flow -> conn(dst)
+
+  // App "sends": one record into the fake tx_ring for the src socket.
+  std::vector<uint8_t> payload(300);
+  std::iota(payload.begin(), payload.end(), 0);
+  PushRecord(&ring, src.pid, src.fd, payload.data(), payload.size());
+
+  // TX seam: drain tx_ring -> MsgBuf (stamped with flow, msg_len set).
+  MachnetRingSlot_t idx[4];
+  juggler::shm::MsgBuf* bufs[4];
+  ASSERT_EQ(ch->DequeueMessages(idx, bufs, 4), 1u);
+
+  // RX seam: hand the SAME buffer straight back in, no wire.
+  ASSERT_EQ(ch->EnqueueMessages(&idx[0], 1), 1u);
+
+  // Verify it landed in dst's ring, intact. Record is [u32 len][payload].
+  uint32_t id = 0;
+  ASSERT_EQ(bpf_map_lookup_elem(outer_fd, &dst, &id), 0);
+  int fd = bpf_map_get_fd_by_id(id);
+  std::vector<uint8_t> raw(sizeof(uint32_t) + payload.size());
+  long n = ReadFirstUserRingRecord(fd, kInnerSize, raw.data(), raw.size());
+  close(fd);
+  ASSERT_EQ(n, static_cast<long>(sizeof(uint32_t) + payload.size()));
+  uint32_t got_len = 0;
+  memcpy(&got_len, raw.data(), sizeof(uint32_t));
+  EXPECT_EQ(got_len, payload.size());
+  EXPECT_EQ(
+      memcmp(raw.data() + sizeof(uint32_t), payload.data(), payload.size()), 0);
+
+  // Ownership flip: TX allocated, RX freed -> pool balanced. tx_ring drained.
+  EXPECT_EQ(ch->GetFreeBufCount(), free_before);
+  EXPECT_EQ(ring.cons, StrideFor(payload.size()));
+
+  close(outer_fd);
+  close(tmpl_fd);
+}
+
+TEST(EpsAutoRoute, ReplyRouteLearnedFromInbound) {
+  using juggler::shm::EpsConnKey;
+  const uint32_t kInnerSize = 4096;
+
+  juggler::shm::ChannelManager mgr;
+  FakeTxRing ring;
+  auto* ch = MakeEpsChannel(&mgr, "-eps-autoroute", &ring);
+
+  int tmpl_fd = bpf_map_create(BPF_MAP_TYPE_USER_RINGBUF, "ar_tmpl", 0, 0,
+                               kInnerSize, nullptr);
+  ASSERT_GE(tmpl_fd, 0);
+  LIBBPF_OPTS(bpf_map_create_opts, oopts,
+              .inner_map_fd = static_cast<uint32_t>(tmpl_fd));
+  int outer_fd =
+      bpf_map_create(BPF_MAP_TYPE_HASH_OF_MAPS, "ar_rings", sizeof(EpsConnKey),
+                     sizeof(uint32_t), 8, &oopts);
+  ASSERT_GE(outer_fd, 0);
+  auto add_conn = [&](const EpsConnKey& k) {
+    int inner = bpf_map_create(BPF_MAP_TYPE_USER_RINGBUF, "ar_conn", 0, 0,
+                               kInnerSize, nullptr);
+    ASSERT_GE(inner, 0);
+    ASSERT_EQ(bpf_map_update_elem(outer_fd, &k, &inner, BPF_ANY), 0);
+    close(inner);
+  };
+  const EpsConnKey client{1000, 3};
+  const EpsConnKey server{2000, 9};
+  add_conn(client);
+  add_conn(server);
+  ch->SetEpsRxRingsFd(outer_fd);
+
+  const MachnetFlow_t fwd = {.src_ip = 0x0A000001,
+                             .dst_ip = 0x0A000002,
+                             .src_port = 1111,
+                             .dst_port = 2222};
+  const MachnetFlow_t rev = {.src_ip = 0x0A000002,
+                             .dst_ip = 0x0A000001,
+                             .src_port = 2222,
+                             .dst_port = 1111};
+
+  ch->RegisterEpsRxFlow(fwd, server, -1);  // inbound fwd delivers to server
+  ch->RegisterEpsRxFlow(rev, client, -1);  // inbound rev delivers to client
+  ch->RegisterEpsTxFlow(client, fwd);      // client's send route
+  // NOTE: server's TX route is NOT registered -- auto-population must learn it.
+
+  // PING: client -> server. Delivery auto-seeds server's reverse route.
+  std::vector<uint8_t> ping(200, 0xAA);
+  PushRecord(&ring, client.pid, client.fd, ping.data(), ping.size());
+  MachnetRingSlot_t idx[4];
+  juggler::shm::MsgBuf* bufs[4];
+  ASSERT_EQ(ch->DequeueMessages(idx, bufs, 4), 1u);
+  ASSERT_EQ(ch->EnqueueMessages(&idx[0], 1), 1u);
+
+  // PONG: server replies with NO registered TX flow.
+  std::vector<uint8_t> pong(240, 0xBB);
+  PushRecord(&ring, server.pid, server.fd, pong.data(), pong.size());
+  ASSERT_EQ(ch->DequeueMessages(idx, bufs, 4), 1u);
+  EXPECT_EQ(bufs[0]->flow()->src_ip, rev.src_ip);  // learned reverse flow
+  EXPECT_EQ(bufs[0]->flow()->dst_ip, rev.dst_ip);
+  EXPECT_EQ(bufs[0]->flow()->src_port, rev.src_port);
+  EXPECT_EQ(bufs[0]->flow()->dst_port, rev.dst_port);
+  ASSERT_EQ(ch->EnqueueMessages(&idx[0], 1), 1u);  // and it delivers
+
+  uint32_t id = 0;
+  ASSERT_EQ(bpf_map_lookup_elem(outer_fd, &client, &id), 0);
+  int fd = bpf_map_get_fd_by_id(id);
+  std::vector<uint8_t> raw(sizeof(uint32_t) + pong.size());
+  long n = ReadFirstUserRingRecord(fd, kInnerSize, raw.data(), raw.size());
+  close(fd);
+  ASSERT_EQ(n, static_cast<long>(sizeof(uint32_t) + pong.size()));
+  EXPECT_EQ(memcmp(raw.data() + sizeof(uint32_t), pong.data(), pong.size()), 0);
+
+  close(outer_fd);
+  close(tmpl_fd);
+}
+
 // A real BPF_MAP_TYPE_USER_RINGBUF — no BPF program needed, just the map.
 constexpr size_t kRxRingBytes = 64 * 1024;  // power of two, page-multiple
 

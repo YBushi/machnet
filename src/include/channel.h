@@ -147,6 +147,11 @@ class ShmChannel {
         eventfd;  // ring resolved lazily on first packet
   }
 
+  void RegisterEpsTxFlow(const EpsConnKey& conn, const MachnetFlow_t& flow) {
+    const uint64_t ck = (static_cast<uint64_t>(conn.pid) << 32) | conn.fd;
+    conn_to_flow_[ck] = flow;
+  }
+
   // Get total buffer pool size in bytes.
   size_t GetBufPoolSize() const {
     return __machnet_channel_buf_pool_size(ctx());
@@ -493,6 +498,7 @@ class ShmChannel {
       buf->set_dst_port(flow.dst_port);
       buf->mark_first();
       buf->mark_last();  // EPS caps at MAX_PAYLOAD -> always one buffer
+      buf->set_msg_length(entry->payload_length);
 
       msgs[produced] = buf;
       msg_indices[produced] = GetBufIndex(buf);
@@ -523,6 +529,7 @@ class ShmChannel {
       if (conn == nullptr || conn->ring == nullptr)
         break;  // unknown flow -> stop
 
+      EnsureReverseRoute(head);
       const uint32_t msg_len = head->msg_length();
       void* slot =
           user_ring_buffer__reserve(conn->ring, sizeof(uint32_t) + msg_len);
@@ -546,6 +553,9 @@ class ShmChannel {
       }
 
       // (3) Publish to the app.
+      DCHECK_EQ(static_cast<uint32_t>(
+                    dst - (static_cast<uint8_t*>(slot) + sizeof(uint32_t))),
+                msg_len);
       user_ring_buffer__submit(conn->ring, slot);
       if (conn->eventfd >= 0) {
         const uint64_t one = 1;
@@ -569,6 +579,33 @@ class ShmChannel {
     }
 
     return sent;
+  }
+
+  // Mirror a flow: a reply travels src<->dst, port<->port swapped.
+  static MachnetFlow_t SwapFlow(const MachnetFlow_t& f) {
+    MachnetFlow_t r;
+    r.src_ip = f.dst_ip;
+    r.dst_ip = f.src_ip;
+    r.src_port = f.dst_port;
+    r.dst_port = f.src_port;
+    return r;
+  }
+
+  // On delivering an inbound message to a local socket, seed that socket's
+  // reply (TX) route as the mirror of the incoming flow — so its replies
+  // resolve with no explicit RegisterEpsTxFlow. Poller's
+  // ensure_reverse_routing_exists, on the RX seam. Never clobbers an existing
+  // route (matches the poller's early return).
+  void EnsureReverseRoute(const MsgBuf* head) {
+    const MachnetFlow_t* in = head->flow();
+    auto fit = flow_to_conn_.find(
+        std::make_tuple(in->src_ip, in->dst_ip, in->src_port, in->dst_port));
+    if (fit == flow_to_conn_.end()) return;  // unknown flow, nothing to seed
+    const EpsConnKey& receiver = fit->second;
+    const uint64_t ck =
+        (static_cast<uint64_t>(receiver.pid) << 32) | receiver.fd;
+    if (conn_to_flow_.count(ck)) return;  // already known -> keep it
+    conn_to_flow_[ck] = SwapFlow(*in);
   }
 
   // flow -> conn_key -> inner ring (+eventfd), cached so the hot path never
@@ -606,11 +643,23 @@ class ShmChannel {
 
   /// Step 3 stub. Real version resolves {pid,fd} -> flow from the routing table
   /// merged in from the poller.
-  bool LookupEpsFlow(const EpsConnKey& /*key*/, MachnetFlow_t* out) const {
-    out->src_ip = 0;
-    out->dst_ip = 0;
-    out->src_port = 0;
-    out->dst_port = 0;
+  // conn_key -> wire flow. Mirror of flow_to_conn_ on the RX side.
+  // Miss -> false, so DequeueMessagesEps stalls the record until the route
+  // exists (the poller's "route not built yet -> retry"). Fallback: if no TX
+  // routes were ever registered, return a zero flow so the fake-ring dequeue
+  // tests (which don't register) keep passing unchanged.
+  bool LookupEpsFlow(const EpsConnKey& conn, MachnetFlow_t* out) const {
+    if (conn_to_flow_.empty()) {  // not configured -> legacy zero flow
+      out->src_ip = 0;
+      out->dst_ip = 0;
+      out->src_port = 0;
+      out->dst_port = 0;
+      return true;
+    }
+    const uint64_t ck = (static_cast<uint64_t>(conn.pid) << 32) | conn.fd;
+    auto it = conn_to_flow_.find(ck);
+    if (it == conn_to_flow_.end()) return false;  // route not built -> stall
+    *out = it->second;
     return true;
   }
   const std::string name_;
@@ -636,6 +685,8 @@ class ShmChannel {
   std::map<std::tuple<uint32_t, uint32_t, uint16_t, uint16_t>, EpsConnKey>
       flow_to_conn_;            // wire flow -> local socket
   EpsRxConn legacy_rx_conn_{};  // fallback wrapper for rx_ring_
+  std::map<uint64_t, MachnetFlow_t>
+      conn_to_flow_;  // conn_key -> wire flow (TX)
 };
 
 /**
