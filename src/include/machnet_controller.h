@@ -12,6 +12,7 @@
 #include <machnet_engine.h>
 #include <ud_socket.h>
 #include <uuid/uuid.h>
+#include <set>
 
 #include <csignal>
 #include <thread>
@@ -186,6 +187,9 @@ class MachnetController {
   int eps_connect_fd_{-1};
   int eps_bind_fd_{-1};
   int eps_fd_to_addr_fd_{-1};
+  std::thread eps_ctrl_thread_{};
+  std::set<uint64_t> eps_known_conns_{};
+  std::set<uint16_t> eps_listeners_{};
 };
 }  // namespace juggler
 

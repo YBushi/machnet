@@ -158,6 +158,9 @@ class ShmChannel {
     eps_mode_ = true;
   }
 
+  bool eps_use_real_flows_{false};
+  void SetEpsUseRealFlows(bool v) { eps_use_real_flows_ = v; }
+
   bool IsEpsMode() const { return eps_mode_; }
 
   // Point the RX seam at the pinned outer map of per-connection rings.
@@ -736,6 +739,8 @@ class ShmChannel {
     const uint64_t ck = (static_cast<uint64_t>(conn.pid) << 32) | conn.fd;
     auto it = conn_to_flow_.find(ck);
     if (it != conn_to_flow_.end()) { *out = it->second; return true; }
+    
+    if (eps_use_real_flows_) return false;  // wait for the control loop
 
     if (connect_map_fd_ < 0) {                  // not configured -> legacy
       out->src_ip = 0; out->dst_ip = 0;

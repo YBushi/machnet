@@ -20,6 +20,13 @@ DEFINE_bool(eps_enable, false,
 DEFINE_uint32(eps_local_ip, 0x7F000001,
   "Local IP stamped on EPS flows, in the byte order the eBPF maps "
   "use (default 127.0.0.1).");
+
+static std::string EpsIpToString(uint32_t ip) {   // maps store host order
+  char b[16];
+  snprintf(b, sizeof(b), "%u.%u.%u.%u", (ip >> 24) & 0xFF, (ip >> 16) & 0xFF,
+            (ip >> 8) & 0xFF, ip & 0xFF);
+  return b;
+}
 namespace juggler {
 
 struct MachnetClientContext {
@@ -356,6 +363,9 @@ bool MachnetController::CreateEpsChannel() {
             << "' bound to the eBPF rings; starting relay thread";
   eps_thread_ =
       std::thread(&MachnetController::EpsRelayLoop, this, channel.get());
+  channel->SetEpsUseRealFlows(true);
+  eps_ctrl_thread_ =
+      std::thread(&MachnetController::EpsControlLoop, this, channel.get());
   return true;
 }
 
@@ -424,9 +434,76 @@ void MachnetController::RunController() {
   server_->Run();
 }
 
+void MachnetController::EpsControlLoop(juggler::shm::Channel *channel) {
+  auto *ctx = const_cast<MachnetChannelCtx_t *>(channel->ctx());
+  const std::string local_ip = EpsIpToString(FLAGS_eps_local_ip);
+
+  while (!eps_stop_.load(std::memory_order_relaxed)) {
+    // (1) Servers: every bound address needs a Machnet listener, so inbound
+    //     handshakes create the flow passively.
+    EpsBindKey bk{}, next_bk{};
+    if (bpf_map_get_next_key(eps_bind_fd_, nullptr, &next_bk) == 0) {
+      do {
+        bk = next_bk;
+        EpsConnKey conn{};
+        if (bpf_map_lookup_elem(eps_bind_fd_, &bk, &conn) != 0) continue;
+        if (!eps_listeners_.insert(bk.port).second) continue;   // once per port
+        if (machnet_listen(ctx, local_ip.c_str(), bk.port) == 0) {
+          LOG(INFO) << "EPS: listening on " << local_ip << ":" << bk.port
+                    << " for pid=" << conn.pid << " fd=" << conn.fd;
+        } else {
+          LOG(ERROR) << "EPS: machnet_listen failed on port " << bk.port;
+          eps_listeners_.erase(bk.port);                        // allow retry
+        }
+      } while (bpf_map_get_next_key(eps_bind_fd_, &bk, &next_bk) == 0);
+    }
+
+    // (2) Clients: each connected socket needs a real Machnet flow.
+    EpsConnKey ck{}, next_ck{};
+    if (bpf_map_get_next_key(eps_connect_fd_, nullptr, &next_ck) == 0) {
+      do {
+        ck = next_ck;
+        const uint64_t id = (static_cast<uint64_t>(ck.pid) << 32) | ck.fd;
+        if (eps_known_conns_.count(id)) continue;
+
+        EpsConnDest dest{};
+        if (bpf_map_lookup_elem(eps_connect_fd_, &ck, &dest) != 0) continue;
+
+        // A socket that is itself bound is a server: its flow arrives
+        // passively via the listener, so do not connect outbound for it.
+        EpsBindKey self{};
+        if (eps_fd_to_addr_fd_ >= 0 &&
+            bpf_map_lookup_elem(eps_fd_to_addr_fd_, &ck, &self) == 0 &&
+            eps_listeners_.count(self.port)) {
+          eps_known_conns_.insert(id);
+          continue;
+        }
+
+        MachnetFlow_t flow{};
+        const std::string remote_ip = EpsIpToString(dest.dest_ip);
+        if (machnet_connect(ctx, local_ip.c_str(), remote_ip.c_str(),
+                            dest.dest_port, &flow) != 0) {
+          LOG(ERROR) << "EPS: machnet_connect to " << remote_ip << ":"
+                     << dest.dest_port << " failed";
+          continue;                                   // retry next sweep
+        }
+        eps_known_conns_.insert(id);
+        channel->RegisterEpsTxFlow(ck, flow);         // outbound: {local,remote}
+        MachnetFlow_t rev{flow.dst_ip, flow.src_ip, flow.dst_port, flow.src_port};
+        channel->RegisterEpsRxFlow(rev, ck, -1);      // inbound: {remote,local}
+        LOG(INFO) << "EPS: flow " << local_ip << ":" << flow.src_port << " -> "
+                  << remote_ip << ":" << flow.dst_port
+                  << " for pid=" << ck.pid << " fd=" << ck.fd;
+      } while (bpf_map_get_next_key(eps_connect_fd_, &ck, &next_ck) == 0);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+}
+
 void MachnetController::Stop() {
   eps_stop_.store(true, std::memory_order_relaxed);
   if (eps_thread_.joinable()) eps_thread_.join();
+  if (eps_ctrl_thread_.joinable()) eps_ctrl_thread_.join();
   CHECK_NOTNULL(server_);
   server_->Stop();
 }
