@@ -72,6 +72,16 @@ struct EpsTransmitEntry {
   uint8_t payload_data[1500];  // MAX_PAYLOAD
 };
 
+struct EpsConnDest { 
+  uint32_t dest_ip; 
+  uint16_t dest_port; 
+};
+
+struct EpsBindKey { 
+  uint32_t ip;      
+  uint16_t port;
+};
+
 // Compile-time parity with eps_hooks.bpf.c's `struct tx_entry`. If the BPF side
 // changes, fail the build rather than silently corrupt payloads at runtime.
 static_assert(sizeof(EpsTransmitEntry) == 1512, "tx_entry size drift");
@@ -152,6 +162,16 @@ class ShmChannel {
 
   // Point the RX seam at the pinned outer map of per-connection rings.
   void SetEpsRxRingsFd(int outer_fd) { rx_rings_fd_ = outer_fd; }
+
+  // Point the resolver at the EPS control maps so flows are discovered from
+  // traffic instead of registered by hand.
+  void SetEpsControlMaps(int connect_map_fd, int bind_map_fd, int fd_to_addr_fd,
+    uint32_t local_ip) {
+    connect_map_fd_ = connect_map_fd;
+    bind_map_fd_ = bind_map_fd;
+    fd_to_addr_fd_ = fd_to_addr_fd;
+    eps_local_ip_ = local_ip;
+  }
 
   // Register which local socket a wire flow delivers to, plus its wakeup fd.
   // (This is the poller's flow_routing_table, ported into the daemon.)
@@ -463,6 +483,11 @@ class ShmChannel {
   /// same interface as the classic app_ring path. Returns messages produced;
   /// a short count means "not ready — the rest stay in the ring"
   /// (backpressure).
+  int connect_map_fd_{-1};   // conn_key -> conn_dest (TX resolution)
+  int bind_map_fd_{-1};      // {ip,port} -> conn_key (RX resolution)
+  int fd_to_addr_fd_{-1};
+  uint32_t eps_local_ip_{0}; // src_ip stamped on outbound flows
+
   uint32_t DequeueMessagesEps(MachnetRingSlot_t* msg_indices, MsgBuf** msgs,
                               uint32_t nb_msgs) {
     uint32_t produced = 0;
@@ -495,7 +520,20 @@ class ShmChannel {
           reinterpret_cast<uint8_t*>(hdr) + kBpfRingbufHdrSz);
 
       MachnetFlow_t flow;
-      if (!LookupEpsFlow(entry->conn_id, &flow)) break;  // route not ready yet
+      if (!LookupEpsFlow(entry->conn_id, &flow)) {
+        // Unresolvable. A transient miss (route not built yet) deserves a
+        // retry, but a permanent one (sender exited, gone from connect_map)
+        // would head-of-line block the ring for every other connection
+        // forever. Retry a bounded number of times, then drop and advance.
+        if (++eps_stall_count_ < kEpsMaxStallRetries) break;
+        LOG_EVERY_N(WARNING, 100)
+            << "EPS: dropping unroutable record from pid="
+            << entry->conn_id.pid << " fd=" << entry->conn_id.fd;
+        eps_stall_count_ = 0;
+        AdvanceTxConsumer(stride);
+        continue;
+      }
+      eps_stall_count_ = 0;  // resolved -> reset the stall budget
 
       // (5) Materialise a MsgBuf. The classic path never does this — it just
       //     resolves an index the app already filled.
@@ -621,7 +659,18 @@ class ShmChannel {
     const EpsConnKey& receiver = fit->second;
     const uint64_t ck =
         (static_cast<uint64_t>(receiver.pid) << 32) | receiver.fd;
-    if (conn_to_flow_.count(ck)) return;  // already known -> keep it
+
+    // The BPF sendto hook is gated on connect_map: without an entry the
+    // receiver's reply returns EAGAIN *before* reaching the ring. The poller
+    // seeded this; the fused daemon must. Idempotent, so do it every time.
+    if (connect_map_fd_ >= 0) {
+      EpsConnDest dest{};              // zero-init: padding matters to BPF
+      dest.dest_ip = in->src_ip;
+      dest.dest_port = in->src_port;
+      bpf_map_update_elem(connect_map_fd_, &receiver, &dest, BPF_ANY);
+    }
+
+    if (conn_to_flow_.count(ck)) return;   // reply flow already known
     conn_to_flow_[ck] = SwapFlow(*in);
   }
 
@@ -636,8 +685,19 @@ class ShmChannel {
     const MachnetFlow_t* f = buf->flow();
     auto fit = flow_to_conn_.find(
         std::make_tuple(f->src_ip, f->dst_ip, f->src_port, f->dst_port));
-    if (fit == flow_to_conn_.end()) return nullptr;  // unknown flow
-    const EpsConnKey& conn = fit->second;
+    EpsConnKey conn{};
+    if (fit != flow_to_conn_.end()) {
+      conn = fit->second;
+    } else {
+      if (bind_map_fd_ < 0) return nullptr;
+      EpsBindKey bk{};              // zero-init: padding MUST be zero for BPF
+      bk.ip = f->dst_ip;
+      bk.port = f->dst_port;
+      static_assert(sizeof(EpsBindKey) == 8, "bind_key layout");
+      if (bpf_map_lookup_elem(bind_map_fd_, &bk, &conn) != 0) return nullptr;
+      flow_to_conn_[std::make_tuple(f->src_ip, f->dst_ip,
+                                    f->src_port, f->dst_port)] = conn;
+    }
     const uint64_t ck = (static_cast<uint64_t>(conn.pid) << 32) | conn.fd;
     EpsRxConn& slot = rx_conn_cache_[ck];
     if (slot.ring == nullptr) {  // first packet for this conn
@@ -668,25 +728,45 @@ class ShmChannel {
     __atomic_store_n(tx_consumer_pos_, tx_cons_, __ATOMIC_RELEASE);
   }
 
-  /// Step 3 stub. Real version resolves {pid,fd} -> flow from the routing table
-  /// merged in from the poller.
-  // conn_key -> wire flow. Mirror of flow_to_conn_ on the RX side.
-  // Miss -> false, so DequeueMessagesEps stalls the record until the route
-  // exists (the poller's "route not built yet -> retry"). Fallback: if no TX
-  // routes were ever registered, return a zero flow so the fake-ring dequeue
-  // tests (which don't register) keep passing unchanged.
-  bool LookupEpsFlow(const EpsConnKey& conn, MachnetFlow_t* out) const {
-    if (conn_to_flow_.empty()) {  // not configured -> legacy zero flow
-      out->src_ip = 0;
-      out->dst_ip = 0;
-      out->src_port = 0;
-      out->dst_port = 0;
-      return true;
-    }
+  // conn_key -> wire flow. Cache first; on a miss consult connect_map, which is
+  // where the EPS control plane records each socket's destination. Also seeds
+  // the reverse RX route so the peer's reply finds its way back.
+  // NB: no byte-order conversion anywhere -- values must match bind_map's keys.
+  bool LookupEpsFlow(const EpsConnKey& conn, MachnetFlow_t* out) {
     const uint64_t ck = (static_cast<uint64_t>(conn.pid) << 32) | conn.fd;
     auto it = conn_to_flow_.find(ck);
-    if (it == conn_to_flow_.end()) return false;  // route not built -> stall
-    *out = it->second;
+    if (it != conn_to_flow_.end()) { *out = it->second; return true; }
+
+    if (connect_map_fd_ < 0) {                  // not configured -> legacy
+      out->src_ip = 0; out->dst_ip = 0;
+      out->src_port = 0; out->dst_port = 0;
+      return true;
+    }
+
+    EpsConnDest dest{};
+    if (bpf_map_lookup_elem(connect_map_fd_, &conn, &dest) != 0) {
+      return false;  // not a connected socket yet
+    }
+
+    MachnetFlow_t f{};
+    EpsBindKey self{};                 // zero-init: BPF compares padding
+    if (fd_to_addr_fd_ >= 0 &&
+        bpf_map_lookup_elem(fd_to_addr_fd_, &conn, &self) == 0) {
+      f.src_ip = self.ip;              // the sender's REAL address
+      f.src_port = self.port;
+    } else {                            // fallback: synthetic, may not resolve
+      f.src_ip = eps_local_ip_;
+      f.src_port =
+          static_cast<uint16_t>(49152 + ((conn.pid ^ conn.fd) & 0x3FFF));
+    }
+    f.dst_ip = dest.dest_ip;
+    f.dst_port = dest.dest_port;
+
+    conn_to_flow_[ck] = f;
+    // A reply on the mirrored flow belongs to this same socket.
+    flow_to_conn_[std::make_tuple(f.dst_ip, f.src_ip, f.dst_port, f.src_port)] =
+        conn;
+    *out = f;
     return true;
   }
   const std::string name_;
@@ -699,6 +779,8 @@ class ShmChannel {
   uint32_t cached_buf_count;
   bool eps_mode_{false};
   uint64_t tx_cons_{0};  // consumer offset; persists across calls
+  uint32_t eps_stall_count_{0};
+  static constexpr uint32_t kEpsMaxStallRetries = 1000;
   uint64_t* tx_consumer_pos_{nullptr};
   uint64_t* tx_producer_pos_{nullptr};
   uint8_t* tx_data_{nullptr};

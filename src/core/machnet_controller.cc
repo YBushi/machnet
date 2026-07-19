@@ -5,11 +5,21 @@
 #include <machnet_ctrl.h>
 #include <utils.h>
 #include <worker.h>
+#include <eps_ring.h>
+#include <cstring>
+#include "pause.h"
+#include <gflags/gflags.h>
 
 #include <future>
 #include <memory>
 #include <thread>
 
+DEFINE_bool(eps_enable, false,
+  "Bind a daemon-owned channel to the EPS eBPF rings (AccNet). "
+  "When false the daemon behaves exactly as stock Machnet.");
+DEFINE_uint32(eps_local_ip, 0x7F000001,
+  "Local IP stamped on EPS flows, in the byte order the eBPF maps "
+  "use (default 127.0.0.1).");
 namespace juggler {
 
 struct MachnetClientContext {
@@ -82,6 +92,12 @@ void MachnetController::Run() {
   WorkerPool<MachnetEngine> engine_thread_pool{engines_, cpu_masks};
   engine_thread_pool.Init();
   engine_thread_pool.Launch();
+
+  // EPS: create the daemon-owned channel and start the relay thread BEFORE
+  // RunController() blocks. DPDK and the engines are up by this point.
+  if (!CreateEpsChannel()) {
+    LOG(ERROR) << "EPS: failed to bind the EPS channel; continuing without it";
+  }
 
   // Start the controller server, wait and handle connections.
   RunController();
@@ -292,6 +308,95 @@ bool MachnetController::CreateChannel(
   return status;
 }
 
+bool MachnetController::CreateEpsChannel() {
+  if (!FLAGS_eps_enable) return true;  // stock daemon: nothing happens
+
+  static constexpr const char *kEpsChannelName = "eps0";
+  const auto channel_buffer_size =
+      juggler::dpdk::PmdRing::kDefaultFrameSize - sizeof(juggler::net::Ipv4) -
+      sizeof(juggler::net::Udp) - sizeof(juggler::net::MachnetPktHdr);
+
+  if (!channel_manager_.AddChannel(
+          kEpsChannelName, ChannelManager::kDefaultRingSize,
+          ChannelManager::kDefaultRingSize, ChannelManager::kDefaultBufferCount,
+          channel_buffer_size)) {
+    LOG(ERROR) << "EPS: failed to create channel";
+    return false;
+  }
+  auto channel = channel_manager_.GetChannel(kEpsChannelName);
+  CHECK_NOTNULL(channel);
+
+  uint64_t *cons = nullptr, *prod = nullptr;
+  uint8_t *data = nullptr;
+  eps_tx_fd_ = juggler::eps::OpenTxRing(juggler::eps::kTxRingPin,
+                                        juggler::eps::kTxRingSize, &cons, &prod,
+                                        &data);
+  if (eps_tx_fd_ < 0) {
+    LOG(ERROR) << "EPS: cannot open " << juggler::eps::kTxRingPin
+               << " (is the EPS program loaded?): " << strerror(errno);
+    return false;
+  }
+  eps_rx_rings_fd_ = bpf_obj_get(juggler::eps::kRxRingsPin);
+  eps_connect_fd_ = bpf_obj_get(juggler::eps::kConnectMapPin);
+  eps_bind_fd_ = bpf_obj_get(juggler::eps::kBindMapPin);
+  eps_fd_to_addr_fd_ = bpf_obj_get(juggler::eps::kFdToAddrPin);
+  if (eps_rx_rings_fd_ < 0 || eps_connect_fd_ < 0 || eps_bind_fd_ < 0 ||
+    eps_fd_to_addr_fd_ < 0) {
+    LOG(ERROR) << "EPS: cannot open control maps: " << strerror(errno);
+    return false;
+  }
+
+  channel->EnableEpsMode(cons, prod, data, juggler::eps::kTxRingSize, nullptr,
+                         -1);
+  channel->SetEpsRxRingsFd(eps_rx_rings_fd_);
+  channel->SetEpsControlMaps(eps_connect_fd_, eps_bind_fd_, eps_fd_to_addr_fd_,
+    FLAGS_eps_local_ip);
+
+  LOG(INFO) << "EPS: channel '" << kEpsChannelName
+            << "' bound to the eBPF rings; starting relay thread";
+  eps_thread_ =
+      std::thread(&MachnetController::EpsRelayLoop, this, channel.get());
+  return true;
+}
+
+void MachnetController::EpsRelayLoop(juggler::shm::Channel *channel) {
+  uint64_t dequeued = 0, delivered = 0;
+  auto last_beat = std::chrono::steady_clock::now();
+  while (!eps_stop_.load(std::memory_order_relaxed)) {
+    const auto beat_now = std::chrono::steady_clock::now();
+    if (beat_now - last_beat > std::chrono::seconds(5)) {
+      LOG(INFO) << "EPS: heartbeat dequeued=" << dequeued
+                << " delivered=" << delivered;
+      last_beat = beat_now;
+    }
+    MachnetRingSlot_t idx[32];
+    juggler::shm::MsgBuf *bufs[32];
+    const uint32_t n = channel->DequeueMessages(idx, bufs, 32);
+    if (n == 0) {
+      machnet_pause();
+      continue;
+    }
+    dequeued += n;
+    const uint32_t sent = channel->EnqueueMessages(idx, n);
+    delivered += sent;
+    if (sent != n) {
+      LOG_EVERY_N(WARNING, 100)
+          << "EPS: delivered " << sent << "/" << n << " (dequeued=" << dequeued
+          << " delivered=" << delivered << ") — RX resolution failed";
+      const auto *f = bufs[sent]->flow();
+      LOG_EVERY_N(WARNING, 100)
+          << "EPS: undeliverable flow dst=" << std::hex << f->dst_ip
+          << ":" << std::dec << f->dst_port;
+    }
+    // NOTE: undelivered buffers are freed here, which DROPS the message.
+    // Correct behaviour is backpressure, but for diagnosis we need to see the
+    // flow first.
+    for (uint32_t i = sent; i < n; i++) channel->MsgBufFree(bufs[i]);
+    LOG_EVERY_N(INFO, 1000)
+        << "EPS: dequeued=" << dequeued << " delivered=" << delivered;
+  }
+}
+
 void MachnetController::RunController() {
   const std::string socket_path = MACHNET_CONTROLLER_DEFAULT_PATH;
 
@@ -320,6 +425,8 @@ void MachnetController::RunController() {
 }
 
 void MachnetController::Stop() {
+  eps_stop_.store(true, std::memory_order_relaxed);
+  if (eps_thread_.joinable()) eps_thread_.join();
   CHECK_NOTNULL(server_);
   server_->Stop();
 }

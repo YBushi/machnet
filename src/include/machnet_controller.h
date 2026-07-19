@@ -144,6 +144,18 @@ class MachnetController {
    */
   bool CreateChannel(const uuid_t app_uuid,
                      const machnet_channel_info_t *channel_info, int *fd);
+  
+  /**
+   * @brief Create the daemon-owned EPS channel.
+   * No application registers with EPS, so nothing ever triggers CreateChannel().
+   * This builds one channel at startup, binds it to the pinned eBPF rings and
+   * control maps, and starts the relay thread.
+   * No-op returning true when --eps_enable is false.
+   */
+  bool CreateEpsChannel();
+
+  /** @brief Relay loop: drain tx_ring -> deliver into the peer's rx_ring. */
+  void EpsRelayLoop(juggler::shm::Channel *channel);
 
   /**
    * @brief The main loop of the controller.
@@ -166,6 +178,14 @@ class MachnetController {
   std::unique_ptr<UDServer> server_{nullptr};
   std::unordered_map<std::string, std::unordered_set<std::string>>
       applications_registered_{};
+  // --- EPS bridge; all inert unless --eps_enable ---
+  std::thread eps_thread_{};
+  std::atomic<bool> eps_stop_{false};
+  int eps_tx_fd_{-1};
+  int eps_rx_rings_fd_{-1};
+  int eps_connect_fd_{-1};
+  int eps_bind_fd_{-1};
+  int eps_fd_to_addr_fd_{-1};
 };
 }  // namespace juggler
 

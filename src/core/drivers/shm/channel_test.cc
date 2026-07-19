@@ -1145,25 +1145,23 @@ TEST(EpsRealRing, OpenMapAndDrain) {
 TEST(EpsRealLoopback, IntraHostRoundTrip) {
   const char* kTxPin = "/sys/fs/bpf/accelerated/tx_ring";
   const char* kRxPin = "/sys/fs/bpf/accelerated/rx_rings";
-  const char* cpid = getenv("EPS_CLIENT_PID");
-  const char* cfd  = getenv("EPS_CLIENT_FD");
-  const char* spid = getenv("EPS_SERVER_PID");
-  const char* sfd  = getenv("EPS_SERVER_FD");
-  if (access(kTxPin, F_OK) != 0 || !cpid || !cfd || !spid || !sfd)
-    GTEST_SKIP() << "needs EPS loaded + EPS_CLIENT_PID/FD, EPS_SERVER_PID/FD";
+  if (access(kTxPin, F_OK) != 0)
+    GTEST_SKIP() << "tx_ring not pinned — load the EPS program first";
 
-  using juggler::shm::EpsConnKey;
-  const EpsConnKey client{(uint32_t)atoi(cpid), (uint32_t)atoi(cfd)};
-  const EpsConnKey server{(uint32_t)atoi(spid), (uint32_t)atoi(sfd)};
-
+  // --- open the real rings and the EPS control maps ---
   const size_t kTxSize = 256 * 1024;
   uint64_t *cons = nullptr, *prod = nullptr;
   uint8_t* data = nullptr;
   int tx_fd = OpenEpsTxRing(kTxPin, kTxSize, &cons, &prod, &data);
   ASSERT_GE(tx_fd, 0) << strerror(errno);
-  int rx_outer = bpf_obj_get(kRxPin);
-  ASSERT_GE(rx_outer, 0) << strerror(errno);
+  int rx_outer   = bpf_obj_get(kRxPin);
+  int connect_fd = bpf_obj_get("/sys/fs/bpf/accelerated/connect_map");
+  int bind_fd    = bpf_obj_get("/sys/fs/bpf/accelerated/bind_map");
+  ASSERT_GE(rx_outer, 0)   << strerror(errno);
+  ASSERT_GE(connect_fd, 0) << strerror(errno);
+  ASSERT_GE(bind_fd, 0)    << strerror(errno);
 
+  // --- channel ---
   juggler::shm::ChannelManager mgr;
   std::string name = std::string(fname) + "-eps-realloop";
   ASSERT_TRUE(mgr.AddChannel(name.c_str(), 1 << 11, 1 << 11, 1 << 11, 1 << 12));
@@ -1171,32 +1169,41 @@ TEST(EpsRealLoopback, IntraHostRoundTrip) {
   ASSERT_NE(ch, nullptr);
   ch->EnableEpsMode(cons, prod, data, kTxSize, nullptr, -1);
   ch->SetEpsRxRingsFd(rx_outer);
+  // No hand-registered flows: everything is discovered from the control maps.
+  ch->SetEpsControlMaps(connect_fd, bind_fd, 0x0100007F);  // 127.0.0.1 as BPF stores it
 
-  // Synthetic flow client->server; the server's reply route is auto-learned
-  // by EnsureReverseRoute when we deliver to it.
-  const MachnetFlow_t fwd = {.src_ip = 0x0A000001, .dst_ip = 0x0A000002,
-                             .src_port = 1111, .dst_port = 2222};
-  const MachnetFlow_t rev = {.src_ip = 0x0A000002, .dst_ip = 0x0A000001,
-                             .src_port = 2222, .dst_port = 1111};
-  ch->RegisterEpsTxFlow(client, fwd);
-  ch->RegisterEpsRxFlow(fwd, server, -1);   // -1 => eventfd resolved via pidfd
-  ch->RegisterEpsRxFlow(rev, client, -1);
-
-  // The fused daemon's inner loop: drain tx_ring -> deliver to the peer.
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  const char* secs_s = getenv("EPS_LOOP_SECONDS");
+  const int max_secs = secs_s ? atoi(secs_s) : 10;
+  const auto t_start = std::chrono::steady_clock::now();
+  const auto deadline = t_start + std::chrono::seconds(max_secs);
+  std::chrono::steady_clock::time_point t_first{}, t_last{};
   uint64_t moved = 0;
+
   while (std::chrono::steady_clock::now() < deadline) {
     MachnetRingSlot_t idx[32];
     juggler::shm::MsgBuf* bufs[32];
     uint32_t n = ch->DequeueMessages(idx, bufs, 32);
-    if (n == 0) { machnet_pause(); continue; }
+    if (n == 0) {
+      machnet_pause();
+      if (moved > 0 &&
+          std::chrono::steady_clock::now() - t_last > std::chrono::seconds(3))
+        break;
+      continue;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (moved == 0) t_first = now;
+    t_last = now;
     uint32_t sent = ch->EnqueueMessages(idx, n);
     moved += sent;
     for (uint32_t i = sent; i < n; i++) ch->MsgBufFree(bufs[i]);
   }
-  LOG(INFO) << "moved " << moved << " message(s) through the fused seams";
+
+  const double secs = std::chrono::duration<double>(t_last - t_first).count();
+  LOG(INFO) << "moved " << moved << " msgs in " << secs << " s ("
+            << (secs > 0 ? moved / secs : 0) << " msg/s)";
   EXPECT_GT(moved, 0u);
+  close(bind_fd);
+  close(connect_fd);
   close(rx_outer);
   close(tx_fd);
 }
