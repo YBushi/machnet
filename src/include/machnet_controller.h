@@ -158,6 +158,8 @@ class MachnetController {
   /** @brief Relay loop: drain tx_ring -> deliver into the peer's rx_ring. */
   void EpsRelayLoop(juggler::shm::Channel *channel);
 
+  void EpsControlLoop(juggler::shm::Channel *channel);
+
   /**
    * @brief The main loop of the controller.
    */

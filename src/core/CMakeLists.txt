@@ -14,7 +14,6 @@ find_package(nlohmann_json REQUIRED)
 
 target_include_directories(core PUBLIC ../include)
 target_include_directories(core PRIVATE .)
-target_link_libraries(core PRIVATE)
 target_link_libraries(core PRIVATE nlohmann_json::nlohmann_json)
 target_link_libraries(core PUBLIC PkgConfig::LIBDPDK_STATIC)
 
@@ -22,6 +21,13 @@ target_link_libraries(core PUBLIC PkgConfig::LIBDPDK_STATIC)
 # find_library(DPDK_LIB NAMES libdpdk.a dpdk)
 # target_link_libraries(core PRIVATE dpdk numa dl)
 # target_link_libraries(core PRIVATE -Wl,--whole-archive dpdk -Wl,--no-whole-archive numa dl ${IBVERBS} ${LIBMLX4} ${LIBMLX5})
+
+# --- Machnet shim (EPS control plane) ---
+# machnet_controller.cc drives the control plane through the shim API
+# (machnet_listen / machnet_connect) against the daemon-owned EPS channel, so
+# core depends on the shim. PUBLIC, so the machnet daemon inherits it and does
+# not need its own link entry. No cycle: machnet_shim links only uuid.
+target_link_libraries(core PUBLIC machnet_shim)
 
 # --- vendored libbpf (EPS-backed channel) ---
 # The vendored UAPI must come FIRST so <linux/bpf.h> resolves to libbpf's recent

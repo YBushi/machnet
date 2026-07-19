@@ -9,6 +9,7 @@
 #include <cstring>
 #include "pause.h"
 #include <gflags/gflags.h>
+#include <machnet.h>
 
 #include <future>
 #include <memory>
@@ -435,6 +436,10 @@ void MachnetController::RunController() {
 }
 
 void MachnetController::EpsControlLoop(juggler::shm::Channel *channel) {
+  using juggler::shm::EpsBindKey;
+  using juggler::shm::EpsConnDest;
+  using juggler::shm::EpsConnKey;
+
   auto *ctx = const_cast<MachnetChannelCtx_t *>(channel->ctx());
   const std::string local_ip = EpsIpToString(FLAGS_eps_local_ip);
 
