@@ -187,6 +187,10 @@ class ShmChannel {
         eventfd;  // ring resolved lazily on first packet
   }
 
+  void RegisterEpsListener(uint16_t local_port, const EpsConnKey& conn) {
+    eps_listener_conns_[local_port] = conn;
+  }
+
   void RegisterEpsTxFlow(const EpsConnKey& conn, const MachnetFlow_t& flow) {
     const uint64_t ck = (static_cast<uint64_t>(conn.pid) << 32) | conn.fd;
     conn_to_flow_[ck] = flow;
@@ -583,9 +587,17 @@ class ShmChannel {
       MachnetRingSlot_t head_index = msgbuf_indices[i];
       MsgBuf* head = GetMsgBuf(head_index);
 
-      EpsRxConn* conn = ResolveEpsRxConn(head);  // NEW
-      if (conn == nullptr || conn->ring == nullptr)
-        break;  // unknown flow -> stop
+      EpsRxConn* conn = ResolveEpsRxConn(head);
+      if (conn == nullptr || conn->ring == nullptr) {
+        // Returning short trips the LOG(FATAL) in flow.h and kills the daemon.
+        // Dropping one message is strictly better than aborting the transport.
+        LOG_EVERY_N(WARNING, 100)
+            << "EPS: dropping inbound msg, no local conn for dst port "
+            << head->flow()->dst_port;
+        MsgBufBulkFree(&head_index, 1);
+        sent++;
+        continue;
+      }
 
       EnsureReverseRoute(head);
       const uint32_t msg_len = head->msg_length();
@@ -701,14 +713,20 @@ class ShmChannel {
     if (fit != flow_to_conn_.end()) {
       conn = fit->second;
     } else {
-      if (bind_map_fd_ < 0) return nullptr;
-      EpsBindKey bk{};              // zero-init: padding MUST be zero for BPF
-      bk.ip = f->dst_ip;
-      bk.port = f->dst_port;
-      static_assert(sizeof(EpsBindKey) == 8, "bind_key layout");
-      if (bpf_map_lookup_elem(bind_map_fd_, &bk, &conn) != 0) return nullptr;
-      flow_to_conn_[std::make_tuple(f->src_ip, f->dst_ip,
-                                    f->src_port, f->dst_port)] = conn;
+      auto lit = eps_listener_conns_.find(f->dst_port);
+      if (lit != eps_listener_conns_.end()) {
+        conn = lit->second;                       // passive (server-side) flow
+        flow_to_conn_[std::make_tuple(f->src_ip, f->dst_ip,
+                                      f->src_port, f->dst_port)] = conn;
+      } else {
+        if (bind_map_fd_ < 0) return nullptr;
+        EpsBindKey bk{};
+        bk.ip = f->dst_ip;
+        bk.port = f->dst_port;
+        if (bpf_map_lookup_elem(bind_map_fd_, &bk, &conn) != 0) return nullptr;
+        flow_to_conn_[std::make_tuple(f->src_ip, f->dst_ip,
+                                      f->src_port, f->dst_port)] = conn;
+      }
     }
     const uint64_t ck = (static_cast<uint64_t>(conn.pid) << 32) | conn.fd;
     EpsRxConn& slot = rx_conn_cache_[ck];
@@ -807,6 +825,7 @@ class ShmChannel {
       rx_conn_cache_;  // key (pid<<32)|fd; ring cached
   std::map<std::tuple<uint32_t, uint32_t, uint16_t, uint16_t>, EpsConnKey>
       flow_to_conn_;            // wire flow -> local socket
+  std::map<uint16_t, EpsConnKey> eps_listener_conns_;  // local port -> local socket
   EpsRxConn legacy_rx_conn_{};  // fallback wrapper for rx_ring_
   std::map<uint64_t, MachnetFlow_t>
       conn_to_flow_;  // conn_key -> wire flow (TX)

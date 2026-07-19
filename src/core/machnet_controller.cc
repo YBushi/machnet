@@ -475,6 +475,7 @@ void MachnetController::EpsControlLoop(juggler::shm::Channel *channel) {
         }
       } while (bpf_map_get_next_key(eps_bind_fd_, &bk, &next_bk) == 0);
     }
+    channel->RegisterEpsListener(listen_port, conn);
 
     // (2) Clients: each connected socket needs a real Machnet flow.
     EpsConnKey ck{}, next_ck{};
