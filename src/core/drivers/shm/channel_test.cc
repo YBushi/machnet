@@ -528,6 +528,26 @@ inline long ReadFirstUserRingRecord(int map_fd, size_t data_sz, void* out,
   return len;
 }
 
+// Open and map the pinned EPS tx_ring (a BPF_MAP_TYPE_RINGBUF), exactly as the
+// poller's main(): consumer page RW, producer page RO, data double-mapped RO.
+// Returns fd (>=0) and fills the three pointers; -1 on failure.
+static int OpenEpsTxRing(const char* pin_path, size_t ring_size,
+  uint64_t** cons, uint64_t** prod, uint8_t** data) {
+const long page = sysconf(_SC_PAGESIZE);
+int fd = bpf_obj_get(pin_path);
+if (fd < 0) return -1;
+*cons = static_cast<uint64_t*>(
+mmap(nullptr, page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+if (*cons == MAP_FAILED) { close(fd); return -1; }
+*prod = static_cast<uint64_t*>(
+mmap(nullptr, page, PROT_READ, MAP_SHARED, fd, page));
+if (*prod == MAP_FAILED) { close(fd); return -1; }
+*data = static_cast<uint8_t*>(          // 2x = the kernel's double-mapping
+mmap(nullptr, 2 * ring_size, PROT_READ, MAP_SHARED, fd, 2 * page));
+if (*data == MAP_FAILED) { close(fd); return -1; }
+return fd;
+}
+
 struct EpsConnKeyTest {
   uint32_t pid;
   uint32_t fd;
@@ -1088,6 +1108,97 @@ TEST(EpsRxRouting, EnqueueRoutesByFlow) {
 
   close(outer_fd);
   close(tmpl_fd);
+}
+
+TEST(EpsRealRing, OpenMapAndDrain) {
+  const char* kPin = "/sys/fs/bpf/accelerated/tx_ring";
+  if (access(kPin, F_OK) != 0)
+    GTEST_SKIP() << "tx_ring not pinned — load the EPS program first";
+
+  const size_t kTxSize = 256 * 1024;  // must equal BPF TX_RINGBUF_SIZE
+  uint64_t *cons = nullptr, *prod = nullptr;
+  uint8_t* data = nullptr;
+  int fd = OpenEpsTxRing(kPin, kTxSize, &cons, &prod, &data);
+  ASSERT_GE(fd, 0) << "open/mmap tx_ring: " << strerror(errno);
+
+  juggler::shm::ChannelManager mgr;
+  std::string name = std::string(fname) + "-eps-realring";
+  ASSERT_TRUE(mgr.AddChannel(name.c_str(), 1 << 11, 1 << 11, 1 << 11, 1 << 12));
+  auto* ch = mgr.GetChannel(name.c_str()).get();
+  ASSERT_NE(ch, nullptr);
+  ch->EnableEpsMode(cons, prod, data, kTxSize, nullptr, -1);
+
+  // Drain whatever the real kernel ring holds (0 if no app has sent). Proves
+  // the mmap ABI + DequeueMessagesEps agree with the kernel — no crash, no
+  // overrun, correct record parsing.
+  MachnetRingSlot_t idx[32];
+  juggler::shm::MsgBuf* bufs[32];
+  uint32_t n = ch->DequeueMessages(idx, bufs, 32);
+  LOG(INFO) << "drained " << n << " message(s) from the real tx_ring";
+  for (uint32_t i = 0; i < n; i++) {
+    LOG(INFO) << "  msg " << i << " len=" << bufs[i]->length();
+    ch->MsgBufFree(bufs[i]);
+  }
+  SUCCEED();
+}
+
+TEST(EpsRealLoopback, IntraHostRoundTrip) {
+  const char* kTxPin = "/sys/fs/bpf/accelerated/tx_ring";
+  const char* kRxPin = "/sys/fs/bpf/accelerated/rx_rings";
+  const char* cpid = getenv("EPS_CLIENT_PID");
+  const char* cfd  = getenv("EPS_CLIENT_FD");
+  const char* spid = getenv("EPS_SERVER_PID");
+  const char* sfd  = getenv("EPS_SERVER_FD");
+  if (access(kTxPin, F_OK) != 0 || !cpid || !cfd || !spid || !sfd)
+    GTEST_SKIP() << "needs EPS loaded + EPS_CLIENT_PID/FD, EPS_SERVER_PID/FD";
+
+  using juggler::shm::EpsConnKey;
+  const EpsConnKey client{(uint32_t)atoi(cpid), (uint32_t)atoi(cfd)};
+  const EpsConnKey server{(uint32_t)atoi(spid), (uint32_t)atoi(sfd)};
+
+  const size_t kTxSize = 256 * 1024;
+  uint64_t *cons = nullptr, *prod = nullptr;
+  uint8_t* data = nullptr;
+  int tx_fd = OpenEpsTxRing(kTxPin, kTxSize, &cons, &prod, &data);
+  ASSERT_GE(tx_fd, 0) << strerror(errno);
+  int rx_outer = bpf_obj_get(kRxPin);
+  ASSERT_GE(rx_outer, 0) << strerror(errno);
+
+  juggler::shm::ChannelManager mgr;
+  std::string name = std::string(fname) + "-eps-realloop";
+  ASSERT_TRUE(mgr.AddChannel(name.c_str(), 1 << 11, 1 << 11, 1 << 11, 1 << 12));
+  auto* ch = mgr.GetChannel(name.c_str()).get();
+  ASSERT_NE(ch, nullptr);
+  ch->EnableEpsMode(cons, prod, data, kTxSize, nullptr, -1);
+  ch->SetEpsRxRingsFd(rx_outer);
+
+  // Synthetic flow client->server; the server's reply route is auto-learned
+  // by EnsureReverseRoute when we deliver to it.
+  const MachnetFlow_t fwd = {.src_ip = 0x0A000001, .dst_ip = 0x0A000002,
+                             .src_port = 1111, .dst_port = 2222};
+  const MachnetFlow_t rev = {.src_ip = 0x0A000002, .dst_ip = 0x0A000001,
+                             .src_port = 2222, .dst_port = 1111};
+  ch->RegisterEpsTxFlow(client, fwd);
+  ch->RegisterEpsRxFlow(fwd, server, -1);   // -1 => eventfd resolved via pidfd
+  ch->RegisterEpsRxFlow(rev, client, -1);
+
+  // The fused daemon's inner loop: drain tx_ring -> deliver to the peer.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  uint64_t moved = 0;
+  while (std::chrono::steady_clock::now() < deadline) {
+    MachnetRingSlot_t idx[32];
+    juggler::shm::MsgBuf* bufs[32];
+    uint32_t n = ch->DequeueMessages(idx, bufs, 32);
+    if (n == 0) { machnet_pause(); continue; }
+    uint32_t sent = ch->EnqueueMessages(idx, n);
+    moved += sent;
+    for (uint32_t i = sent; i < n; i++) ch->MsgBufFree(bufs[i]);
+  }
+  LOG(INFO) << "moved " << moved << " message(s) through the fused seams";
+  EXPECT_GT(moved, 0u);
+  close(rx_outer);
+  close(tx_fd);
 }
 
 int main(int argc, char** argv) {

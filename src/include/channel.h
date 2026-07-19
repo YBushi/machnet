@@ -18,6 +18,7 @@
 #include <rte_eal.h>
 #include <rte_mbuf_core.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 
 #include <cstring>
 #include <iterator>
@@ -29,6 +30,13 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_pidfd_getfd
+#define SYS_pidfd_getfd 438
+#endif
 
 namespace juggler {
 class MachnetEngine;  // forward declaration
@@ -63,6 +71,15 @@ struct EpsTransmitEntry {
   uint32_t payload_length;
   uint8_t payload_data[1500];  // MAX_PAYLOAD
 };
+
+// Compile-time parity with eps_hooks.bpf.c's `struct tx_entry`. If the BPF side
+// changes, fail the build rather than silently corrupt payloads at runtime.
+static_assert(sizeof(EpsTransmitEntry) == 1512, "tx_entry size drift");
+static_assert(offsetof(EpsTransmitEntry, conn_id) == 0, "conn_id must be first");
+static_assert(offsetof(EpsTransmitEntry, payload_length) == 8, "len at ofs 8");
+static_assert(offsetof(EpsTransmitEntry, payload_data) == 12, "data at ofs 12");
+static_assert(offsetof(EpsConnKey, pid) == 0, "conn_key: pid then fd");
+static_assert(offsetof(EpsConnKey, fd) == 4, "conn_key: pid then fd");
 
 // BPF ringbuf record ABI (kernel/bpf/ringbuf.c layout, stable userspace
 // contract)
@@ -632,6 +649,16 @@ class ShmChannel {
       slot.ring = user_ring_buffer__new(inner_fd, nullptr);
       close(inner_fd);
       if (slot.ring == nullptr) return nullptr;
+    }
+
+    if (slot.eventfd < 0) {
+      int pid_fd = static_cast<int>(
+          syscall(SYS_pidfd_open, static_cast<pid_t>(conn.pid), 0));
+      if (pid_fd >= 0) {
+        slot.eventfd = static_cast<int>(
+            syscall(SYS_pidfd_getfd, pid_fd, static_cast<int>(conn.fd), 0));
+        close(pid_fd);
+      }
     }
     return &slot;
   }
