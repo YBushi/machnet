@@ -10,6 +10,7 @@
 #include "pause.h"
 #include <gflags/gflags.h>
 #include <machnet.h>
+#include <arpa/inet.h>
 
 #include <future>
 #include <memory>
@@ -362,8 +363,18 @@ bool MachnetController::CreateEpsChannel() {
 
   LOG(INFO) << "EPS: channel '" << kEpsChannelName
             << "' bound to the eBPF rings; starting relay thread";
-  eps_thread_ =
-      std::thread(&MachnetController::EpsRelayLoop, this, channel.get());
+  // Hand the channel to an engine. It now drives DequeueMessages (TX -> wire)
+  // and EnqueueMessages (RX -> app), and services the control ring — without
+  // which machnet_listen/connect cannot even be enqueued.
+  std::promise<bool> p;
+  auto fstatus = p.get_future();
+  const auto &engine = engines_[0];
+  engine->AddChannel(channel, std::move(p));
+  if (!fstatus.get()) {
+    LOG(ERROR) << "EPS: engine refused the channel";
+    return false;
+  }
+  LOG(INFO) << "EPS: channel handed to engine 0";
   channel->SetEpsUseRealFlows(true);
   eps_ctrl_thread_ =
       std::thread(&MachnetController::EpsControlLoop, this, channel.get());
@@ -453,8 +464,10 @@ void MachnetController::EpsControlLoop(juggler::shm::Channel *channel) {
         EpsConnKey conn{};
         if (bpf_map_lookup_elem(eps_bind_fd_, &bk, &conn) != 0) continue;
         if (!eps_listeners_.insert(bk.port).second) continue;   // once per port
-        if (machnet_listen(ctx, local_ip.c_str(), bk.port) == 0) {
-          LOG(INFO) << "EPS: listening on " << local_ip << ":" << bk.port
+
+        const uint16_t listen_port = ntohs(bk.port);
+        if (machnet_listen(ctx, local_ip.c_str(), listen_port) == 0) {
+          LOG(INFO) << "EPS: listening on " << local_ip << ":" << listen_port
                     << " for pid=" << conn.pid << " fd=" << conn.fd;
         } else {
           LOG(ERROR) << "EPS: machnet_listen failed on port " << bk.port;
@@ -486,8 +499,9 @@ void MachnetController::EpsControlLoop(juggler::shm::Channel *channel) {
 
         MachnetFlow_t flow{};
         const std::string remote_ip = EpsIpToString(dest.dest_ip);
+        const uint16_t remote_port = ntohs(dest.dest_port);
         if (machnet_connect(ctx, local_ip.c_str(), remote_ip.c_str(),
-                            dest.dest_port, &flow) != 0) {
+                            remote_port, &flow) != 0) {
           LOG(ERROR) << "EPS: machnet_connect to " << remote_ip << ":"
                      << dest.dest_port << " failed";
           continue;                                   // retry next sweep

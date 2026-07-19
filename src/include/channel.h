@@ -589,9 +589,18 @@ class ShmChannel {
 
       EnsureReverseRoute(head);
       const uint32_t msg_len = head->msg_length();
-      void* slot =
-          user_ring_buffer__reserve(conn->ring, sizeof(uint32_t) + msg_len);
-      if (slot == nullptr) break;  // ring full -> do NOT consume
+      void *slot = nullptr;
+      for (int spin = 0; spin < 1000; spin++) {
+        slot = user_ring_buffer__reserve(conn->ring, sizeof(uint32_t) + msg_len);
+        if (slot != nullptr) break;
+        __builtin_ia32_pause();
+      }
+      if (slot == nullptr) {          // app not draining; dropping beats
+        MsgBufBulkFree(&head_index, 1);  // aborting the whole daemon
+        sent++;
+        continue;
+      }
+
 
       // (2) Length prefix, then the payload, following any SG chain.
       memcpy(slot, &msg_len, sizeof(uint32_t));
