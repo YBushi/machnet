@@ -463,9 +463,16 @@ void MachnetController::EpsControlLoop(juggler::shm::Channel *channel) {
         bk = next_bk;
         EpsConnKey conn{};
         if (bpf_map_lookup_elem(eps_bind_fd_, &bk, &conn) != 0) continue;
-        if (!eps_listeners_.insert(bk.port).second) continue;   // once per port
 
         const uint16_t listen_port = ntohs(bk.port);
+        
+        // Refresh the port -> socket mapping on EVERY sweep. The application
+        // can restart with a new pid while the Machnet listener itself
+        // persists, so this must not be gated on the dedupe below: otherwise
+        // the mapping keeps pointing at the socket of the previous run.
+        channel->RegisterEpsListener(listen_port, conn);
+
+        if (!eps_listeners_.insert(bk.port).second) continue;
         if (machnet_listen(ctx, local_ip.c_str(), listen_port) == 0) {
           LOG(INFO) << "EPS: listening on " << local_ip << ":" << listen_port
                     << " for pid=" << conn.pid << " fd=" << conn.fd;
@@ -475,7 +482,6 @@ void MachnetController::EpsControlLoop(juggler::shm::Channel *channel) {
         }
       } while (bpf_map_get_next_key(eps_bind_fd_, &bk, &next_bk) == 0);
     }
-    channel->RegisterEpsListener(listen_port, conn);
 
     // (2) Clients: each connected socket needs a real Machnet flow.
     EpsConnKey ck{}, next_ck{};

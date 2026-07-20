@@ -19,7 +19,8 @@
 #include <rte_mbuf_core.h>
 #include <unistd.h>
 #include <sys/syscall.h>
-
+#include <atomic>
+#include <vector>
 #include <cstring>
 #include <iterator>
 #include <list>
@@ -188,6 +189,16 @@ class ShmChannel {
   }
 
   void RegisterEpsListener(uint16_t local_port, const EpsConnKey& conn) {
+    auto it = eps_listener_conns_.find(local_port);
+    if (it != eps_listener_conns_.end()) {
+      const EpsConnKey& old = it->second;
+      if (old.pid == conn.pid && old.fd == conn.fd) return;  // unchanged
+      // A different socket now owns this port: the previous server exited.
+      // Its cached ring and eventfd are still held here and would keep
+      // resolving successfully, so inbound messages would be written into a
+      // buffer nobody reads. Retire them.
+      QueueEpsEviction(old);
+    }
     eps_listener_conns_[local_port] = conn;
   }
 
@@ -528,19 +539,25 @@ class ShmChannel {
 
       MachnetFlow_t flow;
       if (!LookupEpsFlow(entry->conn_id, &flow)) {
-        // Unresolvable. A transient miss (route not built yet) deserves a
-        // retry, but a permanent one (sender exited, gone from connect_map)
-        // would head-of-line block the ring for every other connection
-        // forever. Retry a bounded number of times, then drop and advance.
-        if (++eps_stall_count_ < kEpsMaxStallRetries) break;
+        // Two very different reasons the flow can be missing:
+        //   transient - the control loop is still doing the machnet_connect
+        //               handshake (~1 s). The record MUST wait.
+        //   permanent - the socket is gone, so no flow will ever appear and
+        //               stalling would head-of-line block the whole ring.
+        // connect_map membership is what distinguishes them; a spin budget
+        // cannot, because the dequeue loop runs orders of magnitude faster
+        // than the control plane.
+        EpsConnDest probe{};
+        const bool conn_alive =
+            connect_map_fd_ >= 0 &&
+            bpf_map_lookup_elem(connect_map_fd_, &entry->conn_id, &probe) == 0;
+        if (conn_alive) break;                 // wait; do NOT consume
         LOG_EVERY_N(WARNING, 100)
-            << "EPS: dropping unroutable record from pid="
-            << entry->conn_id.pid << " fd=" << entry->conn_id.fd;
-        eps_stall_count_ = 0;
+            << "EPS: dropping record from dead conn pid=" << entry->conn_id.pid
+            << " fd=" << entry->conn_id.fd;
         AdvanceTxConsumer(stride);
         continue;
       }
-      eps_stall_count_ = 0;  // resolved -> reset the stall budget
 
       // (5) Materialise a MsgBuf. The classic path never does this — it just
       //     resolves an index the app already filled.
@@ -580,6 +597,7 @@ class ShmChannel {
   /// remaining messages are still owned by the caller.
   uint32_t EnqueueMessagesEps(MachnetRingSlot_t* msgbuf_indices,
                               uint32_t nb_msgs) {
+    DrainEpsEvictions();
     static constexpr uint32_t kMaxChain = 64;
     uint32_t sent = 0;
 
@@ -690,12 +708,62 @@ class ShmChannel {
     if (connect_map_fd_ >= 0) {
       EpsConnDest dest{};              // zero-init: padding matters to BPF
       dest.dest_ip = in->src_ip;
-      dest.dest_port = in->src_port;
+      dest.dest_port = htons(in->src_port);
       bpf_map_update_elem(connect_map_fd_, &receiver, &dest, BPF_ANY);
     }
 
     if (conn_to_flow_.count(ck)) return;   // reply flow already known
     conn_to_flow_[ck] = SwapFlow(*in);
+  }
+
+  // Control thread -> engine thread handoff. Eviction frees a ring the engine
+  // may be writing into, so it cannot happen on the control thread. The
+  // atomic keeps the hot path to a single acquire load in the common case.
+  std::mutex eps_evict_mtx_;
+  std::vector<EpsConnKey> eps_evict_queue_;
+  std::atomic<bool> eps_evict_pending_{false};
+
+  void QueueEpsEviction(const EpsConnKey& dead) {
+    std::lock_guard<std::mutex> g(eps_evict_mtx_);
+    eps_evict_queue_.push_back(dead);
+    eps_evict_pending_.store(true, std::memory_order_release);
+  }
+
+  void DrainEpsEvictions() {
+    if (!eps_evict_pending_.load(std::memory_order_acquire)) return;
+    std::vector<EpsConnKey> dead;
+    {
+      std::lock_guard<std::mutex> g(eps_evict_mtx_);
+      dead.swap(eps_evict_queue_);
+      eps_evict_pending_.store(false, std::memory_order_release);
+    }
+    for (const auto& d : dead) EvictEpsConn(d);
+  }
+
+  // Drop every cached artefact belonging to a socket that is gone. This is the
+  // poller's evict_receive_conn, ported to the fused daemon.
+  void EvictEpsConn(const EpsConnKey& dead) {
+    const uint64_t ck = (static_cast<uint64_t>(dead.pid) << 32) | dead.fd;
+
+    auto cit = rx_conn_cache_.find(ck);
+    if (cit != rx_conn_cache_.end()) {
+      if (cit->second.ring != nullptr) user_ring_buffer__free(cit->second.ring);
+      if (cit->second.eventfd >= 0) close(cit->second.eventfd);
+      rx_conn_cache_.erase(cit);
+    }
+    conn_to_flow_.erase(ck);
+
+    // Any wire flow that resolved to this socket must resolve again, so the
+    // next run's flow is not shadowed by the previous run's cache entry.
+    for (auto it = flow_to_conn_.begin(); it != flow_to_conn_.end();) {
+      if (it->second.pid == dead.pid && it->second.fd == dead.fd) {
+        it = flow_to_conn_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    LOG(INFO) << "EPS: evicted cached state for pid=" << dead.pid
+              << " fd=" << dead.fd;
   }
 
   // flow -> conn_key -> inner ring (+eventfd), cached so the hot path never
@@ -722,7 +790,7 @@ class ShmChannel {
         if (bind_map_fd_ < 0) return nullptr;
         EpsBindKey bk{};
         bk.ip = f->dst_ip;
-        bk.port = f->dst_port;
+        bk.port = htons(f->dst_port);
         if (bpf_map_lookup_elem(bind_map_fd_, &bk, &conn) != 0) return nullptr;
         flow_to_conn_[std::make_tuple(f->src_ip, f->dst_ip,
                                       f->src_port, f->dst_port)] = conn;
@@ -785,14 +853,14 @@ class ShmChannel {
     if (fd_to_addr_fd_ >= 0 &&
         bpf_map_lookup_elem(fd_to_addr_fd_, &conn, &self) == 0) {
       f.src_ip = self.ip;              // the sender's REAL address
-      f.src_port = self.port;
+      f.src_port = ntohs(self.port);
     } else {                            // fallback: synthetic, may not resolve
       f.src_ip = eps_local_ip_;
       f.src_port =
           static_cast<uint16_t>(49152 + ((conn.pid ^ conn.fd) & 0x3FFF));
     }
     f.dst_ip = dest.dest_ip;
-    f.dst_port = dest.dest_port;
+    f.dst_port = ntohs(dest.dest_port);
 
     conn_to_flow_[ck] = f;
     // A reply on the mirrored flow belongs to this same socket.
