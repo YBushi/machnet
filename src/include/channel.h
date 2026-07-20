@@ -574,7 +574,7 @@ class ShmChannel {
         break;
       }
       memcpy(payload, entry->payload_data, entry->payload_length);
-
+      
       buf->set_src_ip(flow.src_ip);
       buf->set_src_port(flow.src_port);
       buf->set_dst_ip(flow.dst_ip);
@@ -582,6 +582,7 @@ class ShmChannel {
       buf->mark_first();
       buf->mark_last();  // EPS caps at MAX_PAYLOAD -> always one buffer
       buf->set_msg_length(entry->payload_length);
+      buf->set_last(GetBufIndex(buf));
 
       msgs[produced] = buf;
       msg_indices[produced] = GetBufIndex(buf);
@@ -623,7 +624,18 @@ class ShmChannel {
       }
 
       EnsureReverseRoute(head);
-      const uint32_t msg_len = head->msg_length();
+      uint32_t msg_len = 0;
+      {
+        const MsgBuf* b = head;
+        for (uint32_t k = 0; k < 64; k++) {
+          msg_len += b->length();
+          if (!b->has_next()) break;
+          b = GetMsgBuf(b->next());
+        }
+      }
+      LOG_EVERY_N(INFO, 100) << "EPS: RX msg_len=" << msg_len
+                             << " data_len=" << head->length()
+                             << " has_next=" << head->has_next();
       void *slot = nullptr;
       for (int spin = 0; spin < 1000; spin++) {
         slot = user_ring_buffer__reserve(conn->ring, sizeof(uint32_t) + msg_len);
