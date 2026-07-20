@@ -181,6 +181,7 @@ class ShmChannel {
   // (This is the poller's flow_routing_table, ported into the daemon.)
   void RegisterEpsRxFlow(const MachnetFlow_t& flow, const EpsConnKey& conn,
                          int eventfd) {
+    std::lock_guard<std::mutex> g(eps_maps_mtx);
     flow_to_conn_[std::make_tuple(flow.src_ip, flow.dst_ip, flow.src_port,
                                   flow.dst_port)] = conn;
     const uint64_t ck = (static_cast<uint64_t>(conn.pid) << 32) | conn.fd;
@@ -189,6 +190,7 @@ class ShmChannel {
   }
 
   void RegisterEpsListener(uint16_t local_port, const EpsConnKey& conn) {
+    std::lock_guard<std::mutex> g(eps_maps_mtx);
     auto it = eps_listener_conns_.find(local_port);
     if (it != eps_listener_conns_.end()) {
       const EpsConnKey& old = it->second;
@@ -203,6 +205,7 @@ class ShmChannel {
   }
 
   void RegisterEpsTxFlow(const EpsConnKey& conn, const MachnetFlow_t& flow) {
+    std::lock_guard<std::mutex> g(eps_maps_mtx);
     const uint64_t ck = (static_cast<uint64_t>(conn.pid) << 32) | conn.fd;
     conn_to_flow_[ck] = flow;
   }
@@ -508,6 +511,7 @@ class ShmChannel {
 
   uint32_t DequeueMessagesEps(MachnetRingSlot_t* msg_indices, MsgBuf** msgs,
                               uint32_t nb_msgs) {
+    std::lock_guard<std::mutex> g(eps_maps_mtx);
     uint32_t produced = 0;
 
     while (produced < nb_msgs) {
@@ -597,6 +601,7 @@ class ShmChannel {
   /// remaining messages are still owned by the caller.
   uint32_t EnqueueMessagesEps(MachnetRingSlot_t* msgbuf_indices,
                               uint32_t nb_msgs) {
+    std::lock_guard<std::mutex> g(eps_maps_mtx);
     DrainEpsEvictions();
     static constexpr uint32_t kMaxChain = 64;
     uint32_t sent = 0;
@@ -719,6 +724,7 @@ class ShmChannel {
   // Control thread -> engine thread handoff. Eviction frees a ring the engine
   // may be writing into, so it cannot happen on the control thread. The
   // atomic keeps the hot path to a single acquire load in the common case.
+  std::mutex eps_maps_mtx;
   std::mutex eps_evict_mtx_;
   std::vector<EpsConnKey> eps_evict_queue_;
   std::atomic<bool> eps_evict_pending_{false};
