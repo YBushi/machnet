@@ -465,6 +465,7 @@ void MachnetController::EpsControlLoop(juggler::shm::Channel *channel) {
         if (bpf_map_lookup_elem(eps_bind_fd_, &bk, &conn) != 0) continue;
 
         const uint16_t listen_port = ntohs(bk.port);
+<<<<<<< Updated upstream
         
         // Refresh the port -> socket mapping on EVERY sweep. The application
         // can restart with a new pid while the Machnet listener itself
@@ -472,10 +473,14 @@ void MachnetController::EpsControlLoop(juggler::shm::Channel *channel) {
         // the mapping keeps pointing at the socket of the previous run.
         channel->RegisterEpsListener(listen_port, conn);
 
+=======
+        channel->RegisterEpsListener(listen_port, conn);
+>>>>>>> Stashed changes
         if (!eps_listeners_.insert(bk.port).second) continue;
         if (machnet_listen(ctx, local_ip.c_str(), listen_port) == 0) {
           LOG(INFO) << "EPS: listening on " << local_ip << ":" << listen_port
                     << " for pid=" << conn.pid << " fd=" << conn.fd;
+          channel->RegisterEpsListener(listen_port, conn);  
         } else {
           LOG(ERROR) << "EPS: machnet_listen failed on port " << bk.port;
           eps_listeners_.erase(bk.port);                        // allow retry
