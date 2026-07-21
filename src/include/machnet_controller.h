@@ -191,7 +191,7 @@ class MachnetController {
   int eps_fd_to_addr_map_fd_{-1};
   int eps_listen_map_fd_{-1};
   std::thread eps_ctrl_thread_{};
-  std::set<uint64_t> eps_known_conns_{};
+  std::set<juggler::shm::EpsConnKey> eps_known_conns_{};
   std::set<uint16_t> eps_listeners_{};
 };
 }  // namespace juggler
