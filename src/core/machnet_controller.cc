@@ -338,7 +338,7 @@ bool MachnetController::CreateEpsChannel() {
   auto channel = channel_manager_.GetChannel(kEpsChannelName);
   CHECK_NOTNULL(channel);
 
-  uint64_t *consumer_page = nullptr, 
+  uint64_t *consumer_page = nullptr; 
   uint64_t *producer_page = nullptr;
   uint8_t *data = nullptr;
   eps_tx_fd_ = juggler::eps::OpenTxRing(juggler::eps::kTxRingPin,
@@ -356,7 +356,7 @@ bool MachnetController::CreateEpsChannel() {
   eps_bind_map_fd_ = bpf_obj_get(juggler::eps::kBindMapPin); // {ip, port} -> {pid, fd}
   eps_fd_to_addr_map_fd_ = bpf_obj_get(juggler::eps::kFdToAddrPin); // {pid, fd} -> {ip, port} (local)
   if (eps_rx_rings_map_fd_ < 0 || eps_connect_map_fd_ < 0 || eps_bind_map_fd_ < 0 ||
-    eps_fd_to_addr_map_fd__ < 0) {
+    eps_fd_to_addr_map_fd_ < 0) {
     LOG(ERROR) << "EPS: cannot open control maps: " << strerror(errno);
     return false;
   }
@@ -364,7 +364,7 @@ bool MachnetController::CreateEpsChannel() {
   channel->EnableEpsMode(consumer_page, producer_page, data, juggler::eps::kTxRingSize, nullptr,
                          -1);
   channel->SetEpsRxRingsFd(eps_rx_rings_map_fd_);
-  channel->SetEpsControlMaps(eps_connect_map_fd_, eps_bind_map_fd_, eps_fd_to_addr_map_fd__,
+  channel->SetEpsControlMaps(eps_connect_map_fd_, eps_bind_map_fd_, eps_fd_to_addr_map_fd_,
     FLAGS_eps_local_ip);
 
   LOG(INFO) << "EPS: channel '" << kEpsChannelName
@@ -425,8 +425,8 @@ void MachnetController::EpsControlLoop(juggler::shm::Channel *channel) {
   while (!eps_stop_.load(std::memory_order_relaxed)) {
     /* Servers: every bound address needs a Machnet listener, so inbound
      * handshakes create the flow passively. */
-    EpsBindKey bind_key{}
-    EpsBindKey next_bind_bind_key{};
+    EpsBindKey bind_key{};
+    EpsBindKey next_bind_key{};
     if (bpf_map_get_next_key(eps_bind_map_fd_, nullptr, &next_bind_key) == 0) {
       do {
         bind_key = next_bind_key;
@@ -475,7 +475,7 @@ void MachnetController::EpsControlLoop(juggler::shm::Channel *channel) {
         // at: the listener before accept(), the accepted socket afterwards
         // (accept_exit repoints it). Refresh every sweep.
         EpsConnKey conn{};
-        if (bpf_map_lookup_elem(eps_bind_fd_, &bind_key, &conn) != 0) {
+        if (bpf_map_lookup_elem(eps_bind_map_fd_, &bind_key, &conn) != 0) {
           continue;
         }
 

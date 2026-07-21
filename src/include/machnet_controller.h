@@ -184,11 +184,12 @@ class MachnetController {
   // --- EPS bridge; all inert unless --eps_enable ---
   std::thread eps_thread_{};
   std::atomic<bool> eps_stop_{false};
+  int eps_rx_rings_map_fd_{-1};
   int eps_tx_fd_{-1};
-  int eps_rx_rings_fd_{-1};
-  int eps_connect_fd_{-1};
-  int eps_bind_fd_{-1};
-  int eps_fd_to_addr_fd_{-1};
+  int eps_connect_map_fd_{-1};
+  int eps_bind_map_fd_{-1};
+  int eps_fd_to_addr_map_fd_{-1};
+  int eps_listen_map_fd_{-1};
   std::thread eps_ctrl_thread_{};
   std::set<uint64_t> eps_known_conns_{};
   std::set<uint16_t> eps_listeners_{};
