@@ -18,6 +18,8 @@ static constexpr const char *kConnectMapPin =
     "/sys/fs/bpf/accelerated/connect_map";
 static constexpr const char *kBindMapPin = "/sys/fs/bpf/accelerated/bind_map";
 static constexpr const char *kFdToAddrPin = "/sys/fs/bpf/accelerated/fd_to_addr";
+static constexpr const char *kListenMapPin = "/sys/fs/bpf/accelerated/listen_map";
+
 
 // MUST equal TX_RINGBUF_SIZE in eps_hooks.bpf.c.
 static constexpr size_t kTxRingSize = 256 * 1024;

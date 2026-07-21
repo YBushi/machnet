@@ -317,8 +317,11 @@ bool MachnetController::CreateChannel(
   return status;
 }
 
+/* Create an EPS channel */
 bool MachnetController::CreateEpsChannel() {
-  if (!FLAGS_eps_enable) return true;  // stock daemon: nothing happens
+  if (!FLAGS_eps_enable) {
+    return true; // stock daemon: nothing happens
+  }
 
   static constexpr const char *kEpsChannelName = "eps0";
   const auto channel_buffer_size =
@@ -335,30 +338,33 @@ bool MachnetController::CreateEpsChannel() {
   auto channel = channel_manager_.GetChannel(kEpsChannelName);
   CHECK_NOTNULL(channel);
 
-  uint64_t *cons = nullptr, *prod = nullptr;
+  uint64_t *consumer_page = nullptr, 
+  uint64_t *producer_page = nullptr;
   uint8_t *data = nullptr;
   eps_tx_fd_ = juggler::eps::OpenTxRing(juggler::eps::kTxRingPin,
-                                        juggler::eps::kTxRingSize, &cons, &prod,
+                                        juggler::eps::kTxRingSize, &consumer_page, &producer_page,
                                         &data);
   if (eps_tx_fd_ < 0) {
     LOG(ERROR) << "EPS: cannot open " << juggler::eps::kTxRingPin
                << " (is the EPS program loaded?): " << strerror(errno);
     return false;
   }
-  eps_rx_rings_fd_ = bpf_obj_get(juggler::eps::kRxRingsPin);
-  eps_connect_fd_ = bpf_obj_get(juggler::eps::kConnectMapPin);
-  eps_bind_fd_ = bpf_obj_get(juggler::eps::kBindMapPin);
-  eps_fd_to_addr_fd_ = bpf_obj_get(juggler::eps::kFdToAddrPin);
-  if (eps_rx_rings_fd_ < 0 || eps_connect_fd_ < 0 || eps_bind_fd_ < 0 ||
-    eps_fd_to_addr_fd_ < 0) {
+
+  // get file descriptors for the eBPF maps
+  eps_rx_rings_map_fd_ = bpf_obj_get(juggler::eps::kRxRingsPin); // {pid, fd} -> USER_RINGBUF
+  eps_connect_map_fd_ = bpf_obj_get(juggler::eps::kConnectMapPin); // {pid, fd} -> {ip, port}
+  eps_bind_map_fd_ = bpf_obj_get(juggler::eps::kBindMapPin); // {ip, port} -> {pid, fd}
+  eps_fd_to_addr_map_fd_ = bpf_obj_get(juggler::eps::kFdToAddrPin); // {pid, fd} -> {ip, port} (local)
+  if (eps_rx_rings_map_fd_ < 0 || eps_connect_map_fd_ < 0 || eps_bind_map_fd_ < 0 ||
+    eps_fd_to_addr_map_fd__ < 0) {
     LOG(ERROR) << "EPS: cannot open control maps: " << strerror(errno);
     return false;
   }
 
-  channel->EnableEpsMode(cons, prod, data, juggler::eps::kTxRingSize, nullptr,
+  channel->EnableEpsMode(consumer_page, producer_page, data, juggler::eps::kTxRingSize, nullptr,
                          -1);
-  channel->SetEpsRxRingsFd(eps_rx_rings_fd_);
-  channel->SetEpsControlMaps(eps_connect_fd_, eps_bind_fd_, eps_fd_to_addr_fd_,
+  channel->SetEpsRxRingsFd(eps_rx_rings_map_fd_);
+  channel->SetEpsControlMaps(eps_connect_map_fd_, eps_bind_map_fd_, eps_fd_to_addr_map_fd__,
     FLAGS_eps_local_ip);
 
   LOG(INFO) << "EPS: channel '" << kEpsChannelName
@@ -366,10 +372,10 @@ bool MachnetController::CreateEpsChannel() {
   // Hand the channel to an engine. It now drives DequeueMessages (TX -> wire)
   // and EnqueueMessages (RX -> app), and services the control ring — without
   // which machnet_listen/connect cannot even be enqueued.
-  std::promise<bool> p;
-  auto fstatus = p.get_future();
+  std::promise<bool> promise;
+  auto fstatus = promise.get_future();
   const auto &engine = engines_[0];
-  engine->AddChannel(channel, std::move(p));
+  engine->AddChannel(channel, std::move(promise));
   if (!fstatus.get()) {
     LOG(ERROR) << "EPS: engine refused the channel";
     return false;
@@ -379,44 +385,6 @@ bool MachnetController::CreateEpsChannel() {
   eps_ctrl_thread_ =
       std::thread(&MachnetController::EpsControlLoop, this, channel.get());
   return true;
-}
-
-void MachnetController::EpsRelayLoop(juggler::shm::Channel *channel) {
-  uint64_t dequeued = 0, delivered = 0;
-  auto last_beat = std::chrono::steady_clock::now();
-  while (!eps_stop_.load(std::memory_order_relaxed)) {
-    const auto beat_now = std::chrono::steady_clock::now();
-    if (beat_now - last_beat > std::chrono::seconds(5)) {
-      LOG(INFO) << "EPS: heartbeat dequeued=" << dequeued
-                << " delivered=" << delivered;
-      last_beat = beat_now;
-    }
-    MachnetRingSlot_t idx[32];
-    juggler::shm::MsgBuf *bufs[32];
-    const uint32_t n = channel->DequeueMessages(idx, bufs, 32);
-    if (n == 0) {
-      machnet_pause();
-      continue;
-    }
-    dequeued += n;
-    const uint32_t sent = channel->EnqueueMessages(idx, n);
-    delivered += sent;
-    if (sent != n) {
-      LOG_EVERY_N(WARNING, 100)
-          << "EPS: delivered " << sent << "/" << n << " (dequeued=" << dequeued
-          << " delivered=" << delivered << ") — RX resolution failed";
-      const auto *f = bufs[sent]->flow();
-      LOG_EVERY_N(WARNING, 100)
-          << "EPS: undeliverable flow dst=" << std::hex << f->dst_ip
-          << ":" << std::dec << f->dst_port;
-    }
-    // NOTE: undelivered buffers are freed here, which DROPS the message.
-    // Correct behaviour is backpressure, but for diagnosis we need to see the
-    // flow first.
-    for (uint32_t i = sent; i < n; i++) channel->MsgBufFree(bufs[i]);
-    LOG_EVERY_N(INFO, 1000)
-        << "EPS: dequeued=" << dequeued << " delivered=" << delivered;
-  }
 }
 
 void MachnetController::RunController() {
@@ -455,16 +423,19 @@ void MachnetController::EpsControlLoop(juggler::shm::Channel *channel) {
   const std::string local_ip = EpsIpToString(FLAGS_eps_local_ip);
 
   while (!eps_stop_.load(std::memory_order_relaxed)) {
-    // (1) Servers: every bound address needs a Machnet listener, so inbound
-    //     handshakes create the flow passively.
-    EpsBindKey bk{}, next_bk{};
-    if (bpf_map_get_next_key(eps_bind_fd_, nullptr, &next_bk) == 0) {
+    /* Servers: every bound address needs a Machnet listener, so inbound
+     * handshakes create the flow passively. */
+    EpsBindKey bind_key{}
+    EpsBindKey next_bind_bind_key{};
+    if (bpf_map_get_next_key(eps_bind_map_fd_, nullptr, &next_bind_key) == 0) {
       do {
-        bk = next_bk;
+        bind_key = next_bind_key;
         EpsConnKey conn{};
-        if (bpf_map_lookup_elem(eps_bind_fd_, &bk, &conn) != 0) continue;
+        if (bpf_map_lookup_elem(eps_bind_map_fd_, &bind_key, &conn) != 0) {
+          continue;
+        }
 
-        const uint16_t listen_port = ntohs(bk.port);
+        const uint16_t listen_port = ntohs(bind_key.port);
         
         // Refresh the port -> socket mapping on EVERY sweep. The application
         // can restart with a new pid while the Machnet listener itself
@@ -472,55 +443,56 @@ void MachnetController::EpsControlLoop(juggler::shm::Channel *channel) {
         // the mapping keeps pointing at the socket of the previous run.
         channel->RegisterEpsListener(listen_port, conn);
 
-        if (!eps_listeners_.insert(bk.port).second) continue;
+        if (!eps_listeners_.insert(bind_key.port).second) {
+          continue;
+        }
         if (machnet_listen(ctx, local_ip.c_str(), listen_port) == 0) {
           LOG(INFO) << "EPS: listening on " << local_ip << ":" << listen_port
                     << " for pid=" << conn.pid << " fd=" << conn.fd;
         } else {
-          LOG(ERROR) << "EPS: machnet_listen failed on port " << bk.port;
-          eps_listeners_.erase(bk.port);                        // allow retry
+          LOG(ERROR) << "EPS: machnet_listen failed on port " << bind_key.port;
+          eps_listeners_.erase(bind_key.port);                        // allow retry
         }
-      } while (bpf_map_get_next_key(eps_bind_fd_, &bk, &next_bk) == 0);
+      } while (bpf_map_get_next_key(eps_bind_map_fd_, &bind_key, &next_bind_key) == 0);
     }
 
-    // (2) Clients: each connected socket needs a real Machnet flow.
-    EpsConnKey ck{}, next_ck{};
-    if (bpf_map_get_next_key(eps_connect_fd_, nullptr, &next_ck) == 0) {
+    // Clients: each connected socket needs a real Machnet flow.
+    // (1) Servers: every LISTENING endpoint needs a Machnet listener. Iterating
+    //     bind_map here was wrong: a client that binds a source port is not a
+    //     server, and creating a listener for it also made the sweep-2 guard
+    //     below suppress its machnet_connect, so it never got a flow at all.
+    EpsConnKey listen_key{};
+    EpsConnKey next_listen_key{};
+    if (bpf_map_get_next_key(eps_listen_map_fd_, nullptr, &next_listen_key) == 0) {
       do {
-        ck = next_ck;
-        const uint64_t id = (static_cast<uint64_t>(ck.pid) << 32) | ck.fd;
-        if (eps_known_conns_.count(id)) continue;
-
-        EpsConnDest dest{};
-        if (bpf_map_lookup_elem(eps_connect_fd_, &ck, &dest) != 0) continue;
-
-        // A socket that is itself bound is a server: its flow arrives
-        // passively via the listener, so do not connect outbound for it.
-        EpsBindKey self{};
-        if (eps_fd_to_addr_fd_ >= 0 &&
-            bpf_map_lookup_elem(eps_fd_to_addr_fd_, &ck, &self) == 0 &&
-            eps_listeners_.count(self.port)) {
-          eps_known_conns_.insert(id);
+        listen_key = next_listen_key;
+        EpsBindKey bind_key{};
+        if (bpf_map_lookup_elem(eps_listen_map_fd_, &listen_key, &bind_key) != 0) {
           continue;
         }
 
-        MachnetFlow_t flow{};
-        const std::string remote_ip = EpsIpToString(dest.dest_ip);
-        const uint16_t remote_port = ntohs(dest.dest_port);
-        if (machnet_connect(ctx, local_ip.c_str(), remote_ip.c_str(),
-                            remote_port, &flow) != 0) {
-          LOG(ERROR) << "EPS: machnet_connect to " << remote_ip << ":"
-                     << dest.dest_port << " failed";
-          continue;                                   // retry next sweep
+        // The socket that RECEIVES on this endpoint is whatever bind_map points
+        // at: the listener before accept(), the accepted socket afterwards
+        // (accept_exit repoints it). Refresh every sweep.
+        EpsConnKey conn{};
+        if (bpf_map_lookup_elem(eps_bind_fd_, &bind_key, &conn) != 0) {
+          continue;
         }
-        eps_known_conns_.insert(id);
-        channel->RegisterEpsTxFlow(ck, flow);         // outbound: {local,remote}
-        MachnetFlow_t rev{flow.dst_ip, flow.src_ip, flow.dst_port, flow.src_port};
-        channel->RegisterEpsRxFlow(rev, ck, -1);      // inbound: {remote,local}
-        LOG(INFO) << "EPS: flow " << local_ip << ":" << flow.src_port << " -> "
-                  << remote_ip << ":" << flow.dst_port
-                  << " for pid=" << ck.pid << " fd=" << ck.fd;
-      } while (bpf_map_get_next_key(eps_connect_fd_, &ck, &next_ck) == 0);
+
+        const uint16_t listen_port = ntohs(bind_key.port);
+        channel->RegisterEpsListener(listen_port, conn);
+
+        if (!eps_listeners_.insert(bind_key.port).second) {
+          continue;   // listen once
+        }
+        if (machnet_listen(ctx, local_ip.c_str(), listen_port) == 0) {
+          LOG(INFO) << "EPS: listening on " << local_ip << ":" << listen_port
+                    << " for pid=" << conn.pid << " fd=" << conn.fd;
+        } else {
+          LOG(ERROR) << "EPS: machnet_listen failed on port " << listen_port;
+          eps_listeners_.erase(bind_key.port);
+        }
+      } while (bpf_map_get_next_key(eps_listen_map_fd_, &listen_key, &next_listen_key) == 0);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
   }
@@ -528,8 +500,12 @@ void MachnetController::EpsControlLoop(juggler::shm::Channel *channel) {
 
 void MachnetController::Stop() {
   eps_stop_.store(true, std::memory_order_relaxed);
-  if (eps_thread_.joinable()) eps_thread_.join();
-  if (eps_ctrl_thread_.joinable()) eps_ctrl_thread_.join();
+  if (eps_thread_.joinable()) {
+    eps_thread_.join();
+  }
+  if (eps_ctrl_thread_.joinable()) { 
+    eps_ctrl_thread_.join();
+  }
   CHECK_NOTNULL(server_);
   server_->Stop();
 }
