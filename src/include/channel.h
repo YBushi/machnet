@@ -713,6 +713,9 @@ class ShmChannel {
     }
 
     const EpsConnKey& receiver = flow_it->second;
+    if (conn_to_flow_.count(receiver)) {
+      return;   // reply flow already known
+    }
 
     /* The BPF sendto hook is gated on connect_map: without an entry the
      * receiver's reply returns EAGAIN *before* reaching the ring. */
@@ -721,10 +724,6 @@ class ShmChannel {
       dest.dest_ip = in->src_ip;
       dest.dest_port = htons(in->src_port);
       bpf_map_update_elem(connect_map_fd_, &receiver, &dest, BPF_ANY);
-    }
-
-    if (conn_to_flow_.count(receiver)) {
-      return;   // reply flow already known
     }
     conn_to_flow_[receiver] = SwapFlow(*in); // save the reply flow
   }
