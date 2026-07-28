@@ -216,6 +216,7 @@ class ShmChannel {
   void SetEpsConn(const EpsConnKey& conn) {
     eps_conn_ = conn;
     eps_has_conn_ = true;
+    eps_mode_ = true;
   }
   
   const EpsConnKey& GetEpsConn() const {
@@ -639,6 +640,12 @@ class ShmChannel {
       ShmChannel* owner = this;
       MachnetFlow_t flow{};
       auto own_it = eps_socket_channels_.find(entry->conn_id);
+      LOG_EVERY_N(INFO, 1)
+          << "EPS-TX: pid=" << entry->conn_id.pid << " fd=" << entry->conn_id.fd
+          << " registry=" << eps_socket_channels_.size()
+          << " found=" << (own_it != eps_socket_channels_.end())
+          << " has_flow="
+          << (own_it != eps_socket_channels_.end() && own_it->second->HasEpsFlow());
       if (own_it != eps_socket_channels_.end() && own_it->second->HasEpsFlow()) {
         owner = own_it->second.get();
         flow = owner->GetEpsFlow();
@@ -666,6 +673,9 @@ class ShmChannel {
         break;
       }
       memcpy(payload, entry->payload_data, entry->payload_length);
+
+      LOG_EVERY_N(INFO, 1000)                                        
+          << "EPS-TX: produced len=" << entry->payload_length;
 
       buf->set_src_ip(flow.src_ip);
       buf->set_src_port(flow.src_port);
@@ -701,6 +711,7 @@ class ShmChannel {
       MsgBuf* head = GetMsgBuf(head_index);
 
       if (eps_rx_ring_ == nullptr) {
+        LOG_EVERY_N(WARNING, 100) << "EPS-RX: no ring on " << GetName();
         MsgBufBulkFree(&head_index, 1);
         sent++;
         continue;
@@ -755,7 +766,9 @@ class ShmChannel {
               << strerror(errno);
         }
       }
-
+      
+      LOG_EVERY_N(INFO, 1000) << "EPS-RX: delivered len=" << msg_len
+                        << " evfd=" << eps_rx_eventfd_;
       MsgBufBulkFree(chain, chain_len);
       sent++;
     }
@@ -769,6 +782,14 @@ class ShmChannel {
   uint32_t EnqueueMessagesEps(MachnetRingSlot_t* msgbuf_indices,
                               uint32_t nb_msgs) {
     // in the future we should eliminate this
+    LOG_EVERY_N(INFO, 100)                                          // <-- ADD
+    << "EPS-ENQ: on " << GetName() << " has_conn=" << eps_has_conn_
+    << " ring=" << static_cast<const void*>(eps_rx_ring_)
+    << " n=" << nb_msgs;
+
+    // A per-socket channel IS the destination socket: nothing to resolve.
+    if (eps_has_conn_) return EnqueueMessagesEpsSocket(msgbuf_indices, nb_msgs);
+
     std::lock_guard<std::mutex> g(eps_maps_mtx);
     DrainEpsEvictions();
     static constexpr uint32_t kMaxChain = 64;

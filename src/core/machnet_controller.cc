@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <vector>
 #include <bpf/libbpf.h>
+#include <signal.h>
 
 #include <set>
 #include <map>
@@ -263,7 +264,7 @@ void MachnetController::SweepEpsSockets() {
   }
 
   static constexpr size_t kEpsSocketRingSlots = 64;
-  static constexpr size_t kEpsSocketBufSlots = 64;
+  static constexpr size_t kEpsSocketBufSlots = 128;
 
   const auto channel_buffer_size =
       juggler::dpdk::PmdRing::kDefaultFrameSize - sizeof(juggler::net::Ipv4) -
@@ -278,6 +279,12 @@ void MachnetController::SweepEpsSockets() {
     do {
       key = next;
       live.insert(key);
+
+      if (::kill(static_cast<pid_t>(key.pid), 0) != 0 && errno == ESRCH) {
+        live.erase(key);          // let any existing channel be reaped too
+        continue;
+      }
+
       if (eps_conn_channels_.count(key)) continue;  // already have one
 
       const std::string name = "eps_" + std::to_string(key.pid) + "_" +
@@ -315,6 +322,8 @@ void MachnetController::SweepEpsSockets() {
       channel_manager_.DestroyChannel(name.c_str());
       continue;
     }
+    LOG(INFO) << "EPS: registering " << name
+              << " eps_channel_=" << (eps_channel_ ? "set" : "NULL");
     auto ch = channel_manager_.GetChannel(name.c_str());
     eps_conn_channels_[conn] = ch;
     if (eps_channel_) {
