@@ -315,7 +315,11 @@ void MachnetController::SweepEpsSockets() {
       channel_manager_.DestroyChannel(name.c_str());
       continue;
     }
-    eps_conn_channels_[conn] = channel_manager_.GetChannel(name.c_str());
+    auto ch = channel_manager_.GetChannel(name.c_str());
+    eps_conn_channels_[conn] = ch;
+    if (eps_channel_) {
+      eps_channel_->RegisterEpsSocketChannel(conn, ch);
+    }
     LOG(INFO) << "EPS: channel " << name << " ready (pid=" << conn.pid
               << " fd=" << conn.fd << "); " << eps_conn_channels_.size()
               << " socket channels";
@@ -329,6 +333,9 @@ void MachnetController::SweepEpsSockets() {
       continue;
     }
     const std::string name = it->second->GetName();
+    if (eps_channel_) {
+      eps_channel_->UnregisterEpsSocketChannel(it->first);
+    }
     engines_[0]->RemoveChannel(it->second);
     it = eps_conn_channels_.erase(it);
     channel_manager_.DestroyChannel(name.c_str());
@@ -426,6 +433,7 @@ bool MachnetController::CreateEpsChannel() {
   }
   auto channel = channel_manager_.GetChannel(kEpsChannelName);
   CHECK_NOTNULL(channel);
+  eps_channel_ = channel;
 
   uint64_t *consumer_page = nullptr; 
   uint64_t *producer_page = nullptr;

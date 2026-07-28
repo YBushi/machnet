@@ -221,6 +221,18 @@ class ShmChannel {
   const EpsConnKey& GetEpsConn() const {
     return eps_conn_;
   }
+
+  void RegisterEpsSocketChannel(const EpsConnKey& conn,
+    std::shared_ptr<ShmChannel> channel) {
+    std::lock_guard<std::mutex> g(eps_maps_mtx);
+    eps_socket_channels_[conn] = std::move(channel);
+  }
+
+  void UnregisterEpsSocketChannel(const EpsConnKey& conn) {
+    std::lock_guard<std::mutex> g(eps_maps_mtx);
+    eps_socket_channels_.erase(conn);
+  } 
+
   bool IsEpsSocketChannel() const {
     return eps_has_conn_;
   }
@@ -988,17 +1000,6 @@ class ShmChannel {
       }
     }
     return &slot;
-  }
-
-  void RegisterEpsSocketChannel(const EpsConnKey& conn,
-    std::shared_ptr<ShmChannel> channel) {
-    std::lock_guard<std::mutex> g(eps_maps_mtx);
-    eps_socket_channels_[conn] = std::move(channel);
-  }
-
-  void UnregisterEpsSocketChannel(const EpsConnKey& conn) {
-    std::lock_guard<std::mutex> g(eps_maps_mtx);
-    eps_socket_channels_.erase(conn);
   }
 
   void AdvanceTxConsumer(uint64_t stride) {

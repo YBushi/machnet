@@ -196,6 +196,7 @@ class MachnetController {
   std::set<juggler::shm::EpsConnKey> eps_known_conns_{};
   std::set<uint16_t> eps_listeners_{};
   std::map<juggler::shm::EpsConnKey, std::shared_ptr<juggler::shm::Channel>>eps_conn_channels_{};
+  std::shared_ptr<juggler::shm::Channel> eps_channel_{};
 };
 }  // namespace juggler
 
