@@ -213,6 +213,78 @@ class ShmChannel {
     conn_to_flow_[conn] = flow;
   }
 
+  void SetEpsConn(const EpsConnKey& conn) {
+    eps_conn_ = conn;
+    eps_has_conn_ = true;
+  }
+  
+  const EpsConnKey& GetEpsConn() const {
+    return eps_conn;
+  }
+  bool IsEpsSocketChannel() const {
+    return eps_has_conn_
+  }
+
+  void SetEpsFlow(const MachnetFlow_t& flow) {
+    eps_flow_ = flow;
+    eps_has_flow_ = true;
+  }
+  const MachnetFlow_t& GetEpsFlow() const {
+    return eps_flow_;
+  }
+
+  bool HasEpsFlow() const { 
+    return eps_has_flow_;
+  }
+
+  bool OpenEpsRxRing(int rx_rings_outer_fd) {
+    if (!eps_has_conn_ || rx_rings_outer_fd < 0) {
+      return false;
+    }
+
+    if (eps_rx_ring_ == nullptr) {
+      uint32_t inner_id = 0
+      // get the rx_ring for this eps connection
+      if (bpf_map_lookup_elem(rx_rings_outer_fd, &eps_conn, &inner_id) != 0) {
+        return false;
+      }
+
+      int inner_fd = bpf_map_get_fd_by_id(inner_id);
+      if (inner_fd < 0) {
+        return false;
+      }
+
+      // do we want to call this here?
+      eps_rx_ring_ = user_ring_buffer__new(inner_fd, nullptr);
+      close(inner_fd);
+      if (eps_rx_ring_ == nullptr) {
+        return false
+      }
+    }
+
+    if (eps_rx_eventfd_ < 0) {
+      int pid_fd = static_cast<int>(syscall(SYS_pidfd_open, static_cast<pid_t>(eps_conn_.pid), 0));
+
+      if (pid_fd < 0) {
+        return false;
+      }
+      eps_rx_eventfd_ = static_cast<int>(syscall(SYS_pidfd_getfd, pid_fd, static_cast<int>(eps_conn_.fd), 0));
+      close(pid_fd);
+
+      if (eps_rx_eventfd_ < 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  struct user_ring_buffer* GetEpsRxRing() const { 
+    return eps_rx_ring_; 
+  }
+  int GetEpsRxEventfd() const { 
+    return eps_rx_eventfd_; 
+  }
+
   // Get total buffer pool size in bytes.
   size_t GetBufPoolSize() const {
     return __machnet_channel_buf_pool_size(ctx());
@@ -863,14 +935,6 @@ class ShmChannel {
       return false;  // wait for the control loop
     }
 
-    if (connect_map_fd_ < 0) {                  // not configured -> legacy
-      out->src_ip = 0; 
-      out->dst_ip = 0;
-      out->src_port = 0; 
-      out->dst_port = 0;
-      return true;
-    }
-
     EpsConnDest dest{};
     if (bpf_map_lookup_elem(connect_map_fd_, &conn, &dest) != 0) {
       return false;  // not a connected socket yet
@@ -907,10 +971,14 @@ class ShmChannel {
   uint32_t cached_buf_count;
 
   /* EPS */
+  EpsConnKey eps_conn_{};
+  bool eps_has_conn_{false};
+  MachnetFlow_t eps_flow_{};
+  bool eps_has_flow_{false};
+  struct user_ring_buffer* eps_rx_ring_{nullptr};
+  int eps_rx_eventfd_{-1};
   bool eps_mode_{false};
   uint64_t tx_cons_{0};  // consumer offset; persists across calls
-  uint32_t eps_stall_count_{0};
-  static constexpr uint32_t kEpsMaxStallRetries = 1000;
   uint64_t* tx_consumer_pos_{nullptr};
   uint64_t* tx_producer_pos_{nullptr};
   uint8_t* tx_data_{nullptr};

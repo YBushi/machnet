@@ -11,7 +11,16 @@
 #include <gflags/gflags.h>
 #include <machnet.h>
 #include <arpa/inet.h>
+#include <rte_memory.h>
+#include <rte_ethdev.h>
+#include <rte_dev.h>
+#include <rte_errno.h>
+#include <sys/mman.h>
+#include <vector>
+#include <bpf/libbpf.h>
 
+#include <set>
+#include <map>
 #include <future>
 #include <memory>
 #include <thread>
@@ -247,6 +256,86 @@ void MachnetController::UnregisterApplication(const uuid_t app_uuid) {
   LOG(INFO) << "Application unregistered: " << app_uuid_str;
 }
 
+void MachnetController::SweepEpsSockets() {
+  using juggler::shm::EpsConnKey;
+  if (eps_rx_rings_map_fd_ < 0 || engines_.empty()) {
+    return;
+  }
+
+  static constexpr size_t kEpsSocketRingSlots = 64;
+  static constexpr size_t kEpsSocketBufSlots = 64;
+
+  const auto channel_buffer_size =
+      juggler::dpdk::PmdRing::kDefaultFrameSize - sizeof(juggler::net::Ipv4) -
+      sizeof(juggler::net::Udp) - sizeof(juggler::net::MachnetPktHdr);
+  
+  std::set<EpsConnKey> live;
+  std::vector<std::pair<EpsConnKey, std::future<bool>>> pending;
+
+  EpsConnKey key{};
+  EpsConnKey next{};
+  if (bpf_map_get_next_key(eps_rx_rings_map_fd_, nullptr, &next) == 0) {
+    do {
+      key = next;
+      live.insert(key);
+      if (eps_conn_channels_.count(key)) continue;  // already have one
+
+      const std::string name = "eps_" + std::to_string(key.pid) + "_" +
+                               std::to_string(key.fd);
+      if (!channel_manager_.AddChannel(name.c_str(), kEpsSocketRingSlots,
+                                       kEpsSocketRingSlots, kEpsSocketBufSlots,
+                                       channel_buffer_size)) {
+        // Most likely ChannelManager::kMaxChannelNr (32). Loud, not fatal.
+        LOG_EVERY_N(ERROR, 50) << "EPS: cannot create channel " << name;
+        continue;
+      }
+      auto channel = channel_manager_.GetChannel(name.c_str());
+      if (channel == nullptr) continue;
+
+      channel->SetEpsConn(key);
+      if (!channel->OpenEpsRxRing(eps_rx_rings_map_fd_)) {
+        // Daemon has the map entry but not the ring/eventfd yet. Drop the
+        // channel and retry next sweep rather than hold a half-built one.
+        channel_manager_.DestroyChannel(name.c_str());
+        continue;
+      }
+
+      std::promise<bool> promise;
+      pending.emplace_back(key, promise.get_future());
+      engines_[0]->AddChannel(channel, std::move(promise));
+    } while (bpf_map_get_next_key(eps_rx_rings_map_fd_, &key, &next) == 0);
+  }
+
+  // (2) One wait for the whole batch, not one per channel.
+  for (auto& [conn, fut] : pending) {
+    const std::string name =
+        "eps_" + std::to_string(conn.pid) + "_" + std::to_string(conn.fd);
+    if (!fut.get()) {
+      LOG(ERROR) << "EPS: engine refused channel " << name;
+      channel_manager_.DestroyChannel(name.c_str());
+      continue;
+    }
+    eps_conn_channels_[conn] = channel_manager_.GetChannel(name.c_str());
+    LOG(INFO) << "EPS: channel " << name << " ready (pid=" << conn.pid
+              << " fd=" << conn.fd << "); " << eps_conn_channels_.size()
+              << " socket channels";
+  }
+
+  // (3) Reap channels whose socket is gone. RemoveChannel also drops the
+  // channel's listeners and flows from the engine (ChannelsUpdate).
+  for (auto it = eps_conn_channels_.begin(); it != eps_conn_channels_.end();) {
+    if (live.count(it->first)) {
+      ++it;
+      continue;
+    }
+    const std::string name = it->second->GetName();
+    engines_[0]->RemoveChannel(it->second);
+    it = eps_conn_channels_.erase(it);
+    channel_manager_.DestroyChannel(name.c_str());
+    LOG(INFO) << "EPS: reaped channel " << name;
+  }
+}
+
 bool MachnetController::CreateChannel(
     const uuid_t app_uuid, const machnet_channel_info_t *channel_info,
     int *fd) {
@@ -383,8 +472,7 @@ bool MachnetController::CreateEpsChannel() {
   }
   LOG(INFO) << "EPS: channel handed to engine 0";
   channel->SetEpsUseRealFlows(true);
-  eps_ctrl_thread_ =
-      std::thread(&MachnetController::EpsControlLoop, this, channel.get());
+  eps_ctrl_thread_ = std::thread(&MachnetController::EpsControlLoop, this, channel.get());
   return true;
 }
 
@@ -423,7 +511,11 @@ void MachnetController::EpsControlLoop(juggler::shm::Channel *channel) {
   auto *ctx = const_cast<MachnetChannelCtx_t *>(channel->ctx());
   const std::string local_ip = EpsIpToString(FLAGS_eps_local_ip);
 
+  
+
   while (!eps_stop_.load(std::memory_order_relaxed)) {
+    SweepEpsSockets();
+
     LOG_EVERY_N(INFO, 50) << "EPS: sweep alive, listen_fd=" << eps_listen_map_fd_
                           << " connect_fd=" << eps_connect_map_fd_
                           << " bind_fd=" << eps_bind_map_fd_;

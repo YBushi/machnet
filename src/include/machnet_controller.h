@@ -13,6 +13,7 @@
 #include <ud_socket.h>
 #include <uuid/uuid.h>
 #include <set>
+#include <map>
 
 #include <csignal>
 #include <thread>
@@ -154,6 +155,7 @@ class MachnetController {
    * No-op returning true when --eps_enable is false.
    */
   bool CreateEpsChannel();
+  void SweepEpsSockets();
 
   /** @brief Relay loop: drain tx_ring -> deliver into the peer's rx_ring. */
   void EpsRelayLoop(juggler::shm::Channel *channel);
@@ -193,6 +195,7 @@ class MachnetController {
   std::thread eps_ctrl_thread_{};
   std::set<juggler::shm::EpsConnKey> eps_known_conns_{};
   std::set<uint16_t> eps_listeners_{};
+  std::map<juggler::shm::EpsConnKey, std::shared_ptr<juggler::shm::Channel>>eps_conn_channels_{};
 };
 }  // namespace juggler
 
