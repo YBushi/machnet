@@ -219,10 +219,10 @@ class ShmChannel {
   }
   
   const EpsConnKey& GetEpsConn() const {
-    return eps_conn;
+    return eps_conn_;
   }
   bool IsEpsSocketChannel() const {
-    return eps_has_conn_
+    return eps_has_conn_;
   }
 
   void SetEpsFlow(const MachnetFlow_t& flow) {
@@ -243,9 +243,9 @@ class ShmChannel {
     }
 
     if (eps_rx_ring_ == nullptr) {
-      uint32_t inner_id = 0
+      uint32_t inner_id = 0;
       // get the rx_ring for this eps connection
-      if (bpf_map_lookup_elem(rx_rings_outer_fd, &eps_conn, &inner_id) != 0) {
+      if (bpf_map_lookup_elem(rx_rings_outer_fd, &eps_conn_, &inner_id) != 0) {
         return false;
       }
 
@@ -258,7 +258,7 @@ class ShmChannel {
       eps_rx_ring_ = user_ring_buffer__new(inner_fd, nullptr);
       close(inner_fd);
       if (eps_rx_ring_ == nullptr) {
-        return false
+        return false;
       }
     }
 
@@ -584,6 +584,13 @@ class ShmChannel {
    * same interface as the classic app_ring path. Returns messages produced; */
   uint32_t DequeueMessagesEps(MachnetRingSlot_t* msg_indices, MsgBuf** msgs,
                               uint32_t nb_msgs) {
+    
+    /* only eps0 has the shared tx_ring mapped 
+     * per-socket channels don't have producer/consumer */
+    if (eps_has_conn_) {
+      return 0;
+    }
+
     std::lock_guard<std::mutex> g(eps_maps_mtx);
     uint32_t produced = 0;
 
@@ -617,16 +624,15 @@ class ShmChannel {
       const auto* entry = reinterpret_cast<const EpsTransmitEntry*>(
           reinterpret_cast<uint8_t*>(hdr) + kBpfRingbufHdrSz);
 
-      MachnetFlow_t flow;
-      if (!LookupEpsFlow(entry->conn_id, &flow)) {
-        // Two very different reasons the flow can be missing:
-        //   transient - the control loop is still doing the machnet_connect
-        //               handshake (~1 s). The record MUST wait.
-        //   permanent - the socket is gone, so no flow will ever appear and
-        //               stalling would head-of-line block the whole ring.
-        // connect_map membership is what distinguishes them; a spin budget
-        // cannot, because the dequeue loop runs orders of magnitude faster
-        // than the control plane.
+      ShmChannel* owner = this;
+      MachnetFlow_t flow{};
+      auto own_it = eps_socket_channels_.find(entry->conn_id);
+      if (own_it != eps_socket_channels_.end() && own_it->second->HasEpsFlow()) {
+        owner = own_it->second.get();
+        flow = owner->GetEpsFlow();
+      } else if (!LookupEpsFlow(entry->conn_id, &flow)) {
+        // Unchanged: transient (control loop still connecting) vs permanent
+        // (socket gone). connect_map membership distinguishes them.
         EpsConnDest probe{};
         const bool conn_alive =
             connect_map_fd_ >= 0 &&
@@ -638,41 +644,110 @@ class ShmChannel {
         AdvanceTxConsumer(stride);
         continue;
       }
-
-      // Materialise a MsgBuf. The classic path never does this — it just
-      // resolves an index the app already filled.
-      MsgBuf* buf = MsgBufAlloc();
-
-      // pool empty -> backpressure
-      if (buf == nullptr) {
-        break;
-      }
+  
+      MsgBuf* buf = owner->MsgBufAlloc();
+      if (buf == nullptr) break;               // pool empty -> backpressure
 
       auto* payload = buf->append(entry->payload_length);
-      if (payload == nullptr) {  // exceeds buf_mss
-        MsgBufFree(buf);
+      if (payload == nullptr) {                // exceeds buf_mss
+        owner->MsgBufFree(buf);
         break;
       }
       memcpy(payload, entry->payload_data, entry->payload_length);
-      
+
       buf->set_src_ip(flow.src_ip);
       buf->set_src_port(flow.src_port);
       buf->set_dst_ip(flow.dst_ip);
       buf->set_dst_port(flow.dst_port);
       buf->mark_first();
-      buf->mark_last();  // EPS caps at MAX_PAYLOAD -> always one buffer
+      buf->mark_last();
       buf->set_msg_length(entry->payload_length);
-      buf->set_last(GetBufIndex(buf));
+      buf->set_last(owner->GetBufIndex(buf));
 
       msgs[produced] = buf;
-      msg_indices[produced] = GetBufIndex(buf);
+      msg_indices[produced] = owner->GetBufIndex(buf);
       produced++;
 
-      // Commit LAST. Until this line the record is still owned by the ring.
-      AdvanceTxConsumer(stride);
-    }
+    // Commit LAST. Until this line the record is still owned by the ring.
+    AdvanceTxConsumer(stride);
+  }
 
     return produced;
+  }
+
+  /* Delivery for a channel that owns exactly one socket's flow. No mutex: the
+   * ring and eventfd are fixed at channel creation and only the engine thread
+   * touches them. This is the path that survives; the eps0 one above goes when
+   * servers move too. */
+  uint32_t EnqueueMessagesEpsSocket(MachnetRingSlot_t* msgbuf_indices,
+                                    uint32_t nb_msgs) {
+    static constexpr uint32_t kMaxChain = 64;
+    uint32_t sent = 0;
+
+    for (uint32_t i = 0; i < nb_msgs; i++) {
+      MachnetRingSlot_t head_index = msgbuf_indices[i];
+      MsgBuf* head = GetMsgBuf(head_index);
+
+      if (eps_rx_ring_ == nullptr) {
+        MsgBufBulkFree(&head_index, 1);
+        sent++;
+        continue;
+      }
+
+      uint32_t msg_len = 0;
+      {
+        const MsgBuf* b = head;
+        for (uint32_t k = 0; k < kMaxChain; k++) {
+          msg_len += b->length();
+          if (!b->has_next()) break;
+          b = GetMsgBuf(b->next());
+        }
+      }
+
+      void* slot = nullptr;
+      for (int spin = 0; spin < 1000; spin++) {
+        slot = user_ring_buffer__reserve(eps_rx_ring_,
+                                         sizeof(uint32_t) + msg_len);
+        if (slot != nullptr) break;
+        __builtin_ia32_pause();
+      }
+      if (slot == nullptr) {             // app not draining; drop beats abort
+        MsgBufBulkFree(&head_index, 1);
+        sent++;
+        continue;
+      }
+
+      memcpy(slot, &msg_len, sizeof(uint32_t));
+      auto* dst = static_cast<uint8_t*>(slot) + sizeof(uint32_t);
+
+      MachnetRingSlot_t chain[kMaxChain];
+      uint32_t chain_len = 0;
+      MsgBuf* b = head;
+      MachnetRingSlot_t bi = head_index;
+      while (true) {
+        memcpy(dst, b->head_data(), b->length());
+        dst += b->length();
+        chain[chain_len++] = bi;
+        if (!b->has_next() || chain_len >= kMaxChain) break;
+        bi = b->next();
+        b = GetMsgBuf(bi);
+      }
+
+      user_ring_buffer__submit(eps_rx_ring_, slot);
+
+      if (eps_rx_eventfd_ >= 0) {        // wake a blocked recvmsg
+        const uint64_t one = 1;
+        if (write(eps_rx_eventfd_, &one, sizeof(one)) != sizeof(one)) {
+          LOG_EVERY_N(WARNING, 10)
+              << "EPS: eventfd wake failed for fd=" << eps_rx_eventfd_ << ": "
+              << strerror(errno);
+        }
+      }
+
+      MsgBufBulkFree(chain, chain_len);
+      sent++;
+    }
+    return sent;
   }
 
   /// Deliver messages into the app's EPS rx_ring instead of the jring
@@ -915,6 +990,17 @@ class ShmChannel {
     return &slot;
   }
 
+  void RegisterEpsSocketChannel(const EpsConnKey& conn,
+    std::shared_ptr<ShmChannel> channel) {
+    std::lock_guard<std::mutex> g(eps_maps_mtx);
+    eps_socket_channels_[conn] = std::move(channel);
+  }
+
+  void UnregisterEpsSocketChannel(const EpsConnKey& conn) {
+    std::lock_guard<std::mutex> g(eps_maps_mtx);
+    eps_socket_channels_.erase(conn);
+  }
+
   void AdvanceTxConsumer(uint64_t stride) {
     tx_cons_ += stride;
     __atomic_store_n(tx_consumer_pos_, tx_cons_, __ATOMIC_RELEASE);
@@ -993,6 +1079,7 @@ class ShmChannel {
   std::map<uint16_t, EpsConnKey> eps_listener_conns_;  // local port -> local socket
   EpsRxConn legacy_rx_conn_{};  // fallback wrapper for rx_ring_
   std::map<EpsConnKey, MachnetFlow_t> conn_to_flow_;  // conn_key -> wire flow (TX)
+  std::map<EpsConnKey, std::shared_ptr<ShmChannel>> eps_socket_channels_;
 };
 
 /**

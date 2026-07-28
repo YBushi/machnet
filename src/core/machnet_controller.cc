@@ -579,22 +579,29 @@ void MachnetController::EpsControlLoop(juggler::shm::Channel *channel) {
           continue;
         }
 
+        // Clients now get their own channel; the flow is created there, so the
+        // engine delivers RX straight to it and eps0 needs no demux.
+        auto ch_it = eps_conn_channels_.find(conn_key);
+        if (ch_it == eps_conn_channels_.end()) {
+          continue;   // channel not created yet; retry next sweep
+        }
+        const auto &sock_ch = ch_it->second;
+
         MachnetFlow_t flow{};
         const std::string remote_ip = EpsIpToString(dest.dest_ip);
         const uint16_t remote_port = ntohs(dest.dest_port);
-        if (machnet_connect(ctx, local_ip.c_str(), remote_ip.c_str(),
-                            remote_port, &flow) != 0) {
+        if (machnet_connect(const_cast<MachnetChannelCtx_t *>(sock_ch->ctx()),
+                            local_ip.c_str(), remote_ip.c_str(), remote_port,
+                            &flow) != 0) {
           LOG(ERROR) << "EPS: machnet_connect to " << remote_ip << ":"
-                      << remote_port << " failed";
+                     << remote_port << " failed";
           continue;                                   // retry next sweep
         }
         eps_known_conns_.insert(conn_key);
-        channel->RegisterEpsTxFlow(conn_key, flow);         // outbound {local,remote}
-        MachnetFlow_t rev{flow.dst_ip, flow.src_ip, flow.dst_port, flow.src_port};
-        channel->RegisterEpsRxFlow(rev, conn_key, -1);      // inbound {remote,local}
+        sock_ch->SetEpsFlow(flow);                    // TX stamp source
         LOG(INFO) << "EPS: flow " << local_ip << ":" << flow.src_port << " -> "
-                  << remote_ip << ":" << flow.dst_port
-                  << " for pid=" << conn_key.pid << " fd=" << conn_key.fd;
+                  << remote_ip << ":" << flow.dst_port << " on "
+                  << sock_ch->GetName();
       } while (bpf_map_get_next_key(eps_connect_map_fd_, &conn_key, &next_conn_key) == 0);
     }    
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
